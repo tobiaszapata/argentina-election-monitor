@@ -5,14 +5,27 @@ from pathlib import Path
 
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_HERE = Path(__file__).resolve().parent
+# Project root = the folder that holds app.py (utils.py may sit in monitor/ or next to app.py).
+ROOT = _HERE if (_HERE / "app.py").exists() else _HERE.parent
+DATA_DIR = ROOT / "data"
 
 
-def latest_file(folder: str, patterns: tuple, content_key=None) -> tuple:
-    """Return (path, warning). If several files exist, prefer the one with the most recent
-    data according to `content_key(path)`; otherwise the one whose name has the most recent
-    MM-YY or YYYY-MM tag; otherwise the last one alphabetically."""
+def find_file(folder: str, name: str):
+    """data/<folder>/<name> if it exists, else <name> next to app.py, else None."""
+    for f in (DATA_DIR / folder / name, ROOT / name):
+        if f.exists():
+            return f
+    return None
+
+
+def latest_file(folder: str, patterns: tuple, content_key=None, root_patterns: tuple = ()) -> tuple:
+    """Return (path, warning). Looks in data/<folder>/ and, with `root_patterns`, also next to
+    app.py (for repositories uploaded without folders). If several files exist, prefer the one
+    with the most recent data according to `content_key(path)`; otherwise the one whose name
+    has the most recent MM-YY or YYYY-MM tag; otherwise the last one alphabetically."""
     files = [f for p in patterns for f in (DATA_DIR / folder).glob(p)]
+    files += [f for p in root_patterns for f in ROOT.glob(p) if f not in files]
     if not files:
         return None, None
 
@@ -36,8 +49,8 @@ def latest_file(folder: str, patterns: tuple, content_key=None) -> tuple:
     files = sorted(files, key=key)
     warn = None
     if len(files) > 1:
-        warn = (f"Found {len(files)} files in data/{folder}; using {files[-1].name}. "
-                "Delete the older ones to avoid confusion.")
+        warn = (f"Found {len(files)} {folder.upper()} files ({', '.join(f.name for f in files)}); "
+                f"using {files[-1].name}. Delete the older ones to avoid confusion.")
     return files[-1], warn
 
 

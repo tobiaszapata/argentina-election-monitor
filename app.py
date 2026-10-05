@@ -6,15 +6,35 @@ Data sources
 - ICG microdata (.dta) in data/icg/
 - ICC workbook (.xls/.xlsx) in data/icc/
 """
+import sys
+from pathlib import Path
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from monitor import icc as icc_mod
-from monitor import icg as icg_mod
-from monitor import polls as polls_mod
-from monitor import polymarket as pm
-from monitor.utils import DATA_DIR, latest_file, to_excel
+# Make the project folder importable, whether the helper modules sit in monitor/
+# or were uploaded loose next to app.py.
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+try:
+    from monitor import icc as icc_mod
+    from monitor import icg as icg_mod
+    from monitor import polls as polls_mod
+    from monitor import polymarket as pm
+    from monitor.utils import find_file, latest_file, to_excel
+except ModuleNotFoundError:
+    try:
+        import icc as icc_mod
+        import icg as icg_mod
+        import polls as polls_mod
+        import polymarket as pm
+        from utils import find_file, latest_file, to_excel
+    except ModuleNotFoundError:
+        st.error("The helper files are missing. The repository needs a folder called `monitor` "
+                 "(next to app.py) containing icc.py, icg.py, polls.py, polymarket.py and utils.py.")
+        st.stop()
 
 st.set_page_config(page_title="Argentina 2027 election monitor", page_icon="🗳️", layout="wide")
 
@@ -108,9 +128,9 @@ def load_polls(url: str | None, local_stamp: float):
         raw = pd.read_csv(url, dtype=str)
         origin = "Google Sheets"
     else:
-        path = DATA_DIR / "polls" / "polls.csv"
-        raw = pd.read_csv(path, dtype=str) if path.exists() else pd.DataFrame(columns=polls_mod.COLUMNS)
-        origin = "data/polls/polls.csv"
+        path = POLLS_FILE
+        raw = pd.read_csv(path, dtype=str) if path else pd.DataFrame(columns=polls_mod.COLUMNS)
+        origin = path.name if path else "no polls file"
     clean, problems = polls_mod.clean(raw)
     return clean, problems, origin
 
@@ -120,8 +140,10 @@ def _stamp(path):
 
 
 icg_path, icg_warn = latest_file(
-    "icg", ("*.dta",), content_key=lambda f: pd.read_stata(f, columns=["ola"])["ola"].max())
-icc_path, icc_warn = latest_file("icc", ("*.xls", "*.xlsx"))
+    "icg", ("*.dta",), root_patterns=("*.dta",),
+    content_key=lambda f: pd.read_stata(f, columns=["ola"])["ola"].max())
+icc_path, icc_warn = latest_file("icc", ("*.xls", "*.xlsx"), root_patterns=("*ICC*.xls", "*ICC*.xlsx"))
+POLLS_FILE = find_file("polls", "polls.csv")
 ICG = load_icg(str(icg_path), _stamp(icg_path)) if icg_path else None
 ICC = load_icc(str(icc_path), _stamp(icc_path)) if icc_path else None
 
@@ -311,7 +333,7 @@ try:
 except Exception:  # no secrets configured (e.g. running locally)
     polls_url = None
 try:
-    POLLS, poll_problems, poll_origin = load_polls(polls_url, _stamp(DATA_DIR / "polls" / "polls.csv"))
+    POLLS, poll_problems, poll_origin = load_polls(polls_url, _stamp(POLLS_FILE))
 except Exception as e:
     POLLS, poll_problems, poll_origin = pd.DataFrame(), [f"Could not read the polls sheet: {e}"], ""
 
@@ -430,7 +452,7 @@ if ICG and ICC:
 
     section_icg_icc()
 else:
-    st.info("Add the ICG microdata to data/icg and the ICC workbook to data/icc to see this chart.")
+    st.info("Add the ICG microdata (.dta) and the ICC workbook (Serie_ICC_MM-YY.xls) to the repository to see this chart.")
 
 # ================================================================== 4. ICG BY PRESIDENCY
 st.header("Government confidence by presidency", anchor="government-confidence-by-presidency")
@@ -542,7 +564,7 @@ if ICC:
 
     section_icc_breakdown()
 elif not icc_path:
-    st.info("Add the ICC workbook (Serie_ICC_MM-YY.xls) to data/icc to see this section.")
+    st.info("Add the ICC workbook (Serie_ICC_MM-YY.xls) to the repository to see this section.")
 
 st.divider()
 st.caption("Built with public data. Figures are recomputed whenever a new file is uploaded; "
