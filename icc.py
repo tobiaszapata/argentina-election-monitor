@@ -79,3 +79,86 @@ def breakdown(icc: dict, dimension: str) -> pd.DataFrame:
 
 def dimensions(icc: dict) -> list:
     return [d for d in ("Region", "Components") if d in icc]
+
+
+# ------------------------------------------------------------------ monthly sheet (Google Sheets)
+# One row per month, typed from UTDT's monthly ICC report. Header -> (dimension, category).
+SHEET_COLUMNS = [
+    ("ICC", "National"),
+    ("CABA", "CABA"),
+    ("GBA", "GBA"),
+    ("Interior", "Interior"),
+    ("Situacion personal", "Personal situation"),
+    ("Situacion macro", "Macroeconomic situation"),
+    ("Bienes durables", "Durable goods & real estate"),
+]
+SHEET_HEADERS = ["year", "month"] + [h for h, _ in SHEET_COLUMNS]
+_REGIONS = ["CABA", "GBA", "Interior"]
+_COMPONENTS = ["Personal situation", "Macroeconomic situation", "Durable goods & real estate"]
+
+
+def _key(s) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def sheet_template(icc: dict) -> pd.DataFrame:
+    """One row per month from the official workbook (dict returned by load)."""
+    r = icc["Region"].set_index("date")
+    c = icc.get("Components", pd.DataFrame(columns=["date"])).set_index("date")
+    dates = r.index.union(c.index)
+    out = pd.DataFrame(index=dates)
+    out["ICC"] = r["National"].reindex(dates).fillna(c.get("National", pd.Series(dtype=float)).reindex(dates))
+    for h, cat in SHEET_COLUMNS[1:]:
+        src = r if cat in _REGIONS else c
+        out[h] = src[cat].reindex(dates) if cat in src else None
+    out = out.round(2).reset_index(names="date")
+    out.insert(0, "month", out["date"].dt.month)
+    out.insert(0, "year", out["date"].dt.year)
+    return out.drop(columns="date")
+
+
+def from_sheet(raw: pd.DataFrame) -> tuple:
+    """Read the monthly ICC sheet. Returns (dict like load(), problems)."""
+    problems = []
+    cols = {_key(c): c for c in raw.columns}
+    missing = [h for h in ["year", "month", "ICC"] if _key(h) not in cols]
+    if missing:
+        raise ValueError("Missing columns in the ICC sheet: " + ", ".join(missing))
+
+    def num(s):
+        s = s.astype(str).str.strip().str.replace(",", ".", regex=False)
+        return pd.to_numeric(s.replace({"": None, "nan": None, "None": None, "-": None}), errors="coerce")
+
+    df = pd.DataFrame({h: num(raw[cols[_key(h)]]) if _key(h) in cols else pd.Series(dtype=float, index=raw.index)
+                       for h in SHEET_HEADERS}).dropna(how="all")
+    bad = df[["year", "month", "ICC"]].isna().any(axis=1) | ~df["month"].between(1, 12)
+    if bad.any():
+        problems.append(f"{int(bad.sum())} row(s) of the ICC sheet skipped: missing year, month or ICC "
+                        "(sheet rows: " + ", ".join(str(i + 2) for i in df.index[bad][:12]) + ").")
+    df = df[~bad].copy()
+    df["date"] = pd.to_datetime(dict(year=df["year"].astype(int), month=df["month"].astype(int), day=1))
+    dup = df["date"].duplicated(keep="last")
+    if dup.any():
+        problems.append("Some months appear twice in the ICC sheet; the lower row was used for: "
+                        + ", ".join(f"{d:%b %Y}" for d in df.loc[dup, "date"]) + ".")
+        df = df[~dup]
+    df = df.sort_values("date").reset_index(drop=True)
+    vals = df[[h for h, _ in SHEET_COLUMNS]]
+    off = ((vals < 0) | (vals > 100)).any(axis=1)
+    if off.any():
+        problems.append("Values outside 0-100 in the ICC sheet (check for typos): "
+                        + ", ".join(f"{d:%b %Y}" for d in df.loc[off, "date"]) + ".")
+    comp = [h for h, cat in SHEET_COLUMNS if cat in _COMPONENTS]
+    full = df[comp].notna().all(axis=1)
+    gap = (df.loc[full, comp].mean(axis=1) - df.loc[full, "ICC"]).abs()
+    if (gap > 0.3).any():
+        problems.append("In these months the ICC is not the average of its three components, "
+                        "which usually means a typo: "
+                        + ", ".join(f"{d:%b %Y}" for d in df.loc[gap[gap > 0.3].index, "date"]) + ".")
+    named = df.rename(columns={h: cat for h, cat in SHEET_COLUMNS})
+    out = {"Region": named[["date", *_REGIONS, "National"]].copy()}
+    if named[_COMPONENTS].notna().any().any():
+        out["Components"] = named[["date", *_COMPONENTS, "National"]].copy()
+    return out, problems

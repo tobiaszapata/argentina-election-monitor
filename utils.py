@@ -60,11 +60,13 @@ def to_excel(sheets: dict, info: dict) -> bytes:
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         for name, df in sheets.items():
             out = df.copy()
-            for c in out.columns:
-                if isinstance(out[c].dtype, pd.DatetimeTZDtype):
-                    out[c] = out[c].dt.tz_localize(None)
-                if isinstance(out[c].dtype, pd.CategoricalDtype):
-                    out[c] = out[c].astype(str)
+            out.attrs = {}
+            for j in range(out.shape[1]):  # by position, so repeated column names are safe
+                col = out.iloc[:, j]
+                if isinstance(col.dtype, pd.DatetimeTZDtype):
+                    out.isetitem(j, col.dt.tz_localize(None))
+                elif isinstance(col.dtype, pd.CategoricalDtype):
+                    out.isetitem(j, col.astype(str))
             out.to_excel(xw, sheet_name=name[:31], index=False)
             ws = xw.sheets[name[:31]]
             for col in ws.columns:

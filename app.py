@@ -11,6 +11,7 @@ import sys
 import unicodedata
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -49,15 +50,68 @@ MUTED = "#6B7689"
 CANDIDATE_COLORS = {"milei": "#6D28D9", "kicillof": "#1E88E5"}
 PALETTE = ["#1B2A41", "#4FA3D9", "#D99A00", "#C8553D", "#3F8F6B", "#8A94A6", "#0F766E", "#9D4EDD"]
 ICG_COLOR, ICC_COLOR = "#1B2A41", "#D99A00"
-PLOTLY_CONFIG = {"displaylogo": False,
-                 "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"]}
+# Charts are static (no drag-zoom); the period buttons above each chart set the range.
+PLOTLY_CONFIG = {"displaylogo": False, "scrollZoom": False, "modeBarButtons": [["toImage"]],
+                 "toImageButtonOptions": {"format": "png", "scale": 2}}
+
+
+def _dark_theme() -> bool:
+    try:
+        return st.context.theme.type == "dark"
+    except Exception:
+        return False
+
+
+DARK = _dark_theme()
+if DARK:  # light text and lighter first color so lines and labels stay readable
+    INK, GRID, MUTED = "#E3E8EF", "#2B3544", "#9AA3B2"
+    PALETTE[0] = "#AFC2DD"
+    ICG_COLOR = "#AFC2DD"
+AXIS_LINE = "#4A5568" if DARK else "#B8C0CC"
+
+# Period buttons: label -> days back from the last data point ("term" = since Milei took office).
+PERIODS = {
+    "daily": [("All", None), ("6 months", 183), ("3 months", 92), ("1 month", 31),
+              ("15 days", 15), ("7 days", 7)],
+    "monthly": [("All", None), ("10 years", 3653), ("5 years", 1827), ("Current term", "term"),
+                ("1 year", 366)],
+    "polls": [("All", None), ("1 year", 366), ("6 months", 183), ("3 months", 92)],
+}
+
+
+def period_picker(key: str, kind: str, default: str, container=None):
+    labels = [label for label, _ in PERIODS[kind]]
+    box = container or st
+    choice = box.segmented_control("Period", labels, default=default, key=key) or default
+    return dict(PERIODS[kind])[choice]
+
+
+def apply_period(fig: go.Figure, period):
+    """Keep only points from the chosen period, so the y-axis fits what is shown."""
+    if period is None:
+        return
+    xs = [pd.to_datetime(pd.Series(t.x)) for t in fig.data if t.x is not None and len(t.x)]
+    if not xs:
+        return
+    end = max(x.max() for x in xs)
+    start = pd.Timestamp("2023-12-01") if period == "term" else end - pd.Timedelta(days=period)
+    for t in fig.data:
+        if t.x is None or not len(t.x):
+            continue
+        keep = (pd.to_datetime(pd.Series(t.x)) >= start).to_numpy()
+        update = {"x": np.asarray(t.x, dtype=object)[keep]}
+        for attr in ("y", "customdata"):
+            v = getattr(t, attr)
+            if v is not None and len(v) == len(keep):
+                update[attr] = np.asarray(v, dtype=object)[keep]
+        t.update(**update)
 
 st.markdown("""
 <style>
 .block-container {max-width: 1180px; padding-top: 2.2rem;}
 h1 {font-weight: 700; letter-spacing: -0.02em; margin-bottom: 0.2rem;}
 h2 {font-weight: 650; letter-spacing: -0.01em; margin-top: 2.6rem; padding-top: 1.2rem;
-    border-top: 2px solid #1B2A41;}
+    border-top: 2px solid rgba(128, 128, 128, 0.45);}
 h3 {font-weight: 600; margin-top: 1.4rem;}
 [data-testid="stCaptionContainer"] p {color: #5B6577;}
 [data-testid="stMetricValue"] {font-variant-numeric: tabular-nums;}
@@ -88,22 +142,21 @@ def color_for(name: str, i: int) -> str:
 
 
 def base_layout(fig: go.Figure, y_title: str, height: int = 420, time_axis: bool = True,
-                y_suffix: str = "") -> go.Figure:
-    fig.update_layout(
-        height=height, margin=dict(l=10, r=10, t=30, b=10),
-        font=dict(family="Inter, system-ui, -apple-system, Segoe UI, sans-serif", color=INK, size=13),
-        plot_bgcolor="white", paper_bgcolor="white", hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title=None),
-        yaxis=dict(title=y_title, gridcolor=GRID, zeroline=False, ticksuffix=y_suffix),
-        xaxis=dict(gridcolor=GRID, showline=True, linecolor="#B8C0CC"),
-    )
+                y_suffix: str = "", period=None) -> go.Figure:
     if time_axis:
-        fig.update_xaxes(rangeselector=dict(
-            buttons=[dict(count=6, label="6M", step="month", stepmode="backward"),
-                     dict(count=1, label="1Y", step="year", stepmode="backward"),
-                     dict(count=3, label="3Y", step="year", stepmode="backward"),
-                     dict(step="all", label="All")],
-            bgcolor="#F2F5F9", activecolor="#D5DEEA", y=1.12, x=1, xanchor="right"))
+        apply_period(fig, period)
+    fig.update_layout(
+        height=height, margin=dict(l=10, r=10, t=20, b=10),
+        font=dict(family="Inter, system-ui, -apple-system, Segoe UI, sans-serif", color=INK, size=13),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", hovermode="x unified",
+        dragmode=False,
+        hoverlabel=dict(bgcolor="#1F2733" if DARK else "white", font=dict(color=INK)),
+        legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="left", x=0, title=None,
+                    font=dict(color=INK)),
+        yaxis=dict(title=y_title, gridcolor=GRID, zeroline=False, ticksuffix=y_suffix, fixedrange=True,
+                   color=INK),
+        xaxis=dict(gridcolor=GRID, showline=True, linecolor=AXIS_LINE, fixedrange=True, color=INK),
+    )
     return fig
 
 
@@ -124,6 +177,16 @@ def load_icg(path: str, stamp: float):
     nat = icg_mod.national(df)
     parts = {d: icg_mod.breakdown(df, nat, d) for d in [*icg_mod.DIMENSIONS, "Components"]}
     return nat, parts
+
+
+@st.cache_data(ttl=600, show_spinner="Loading government confidence sheet...")
+def load_icg_sheet(url: str):
+    return icg_mod.from_sheet(pd.read_csv(url, dtype=str))
+
+
+@st.cache_data(ttl=600, show_spinner="Loading consumer confidence sheet...")
+def load_icc_sheet(url: str):
+    return icc_mod.from_sheet(pd.read_csv(url, dtype=str))
 
 
 @st.cache_data(show_spinner="Loading consumer confidence series...")
@@ -170,17 +233,43 @@ def _stamp(path):
     return path.stat().st_mtime if path else 0.0
 
 
-icg_path, icg_warn = latest_file(
-    "icg", ("*.dta",), root_patterns=("*.dta",),
-    content_key=lambda f: pd.read_stata(f, columns=["ola"])["ola"].max())
-icc_path, icc_warn = latest_file("icc", ("*.xls", "*.xlsx"), root_patterns=("*ICC*.xls", "*ICC*.xlsx"))
+try:
+    ICG_URL = st.secrets.get("ICG_CSV_URL") or None
+    ICC_URL = st.secrets.get("ICC_CSV_URL") or None
+except Exception:  # no secrets configured (e.g. running locally)
+    ICG_URL = ICC_URL = None
+
 POLLS_FILE = find_file("polls", "polls.csv")
 SPACES_FILE = find_file("polls", "spaces.csv")
-ICG = load_icg(str(icg_path), _stamp(icg_path)) if icg_path else None
-ICC = load_icc(str(icc_path), _stamp(icc_path)) if icc_path else None
+# ICG: the monthly Google Sheet when it is connected; otherwise the microdata (.dta) file.
+ICG, ICG_FROM_SHEET, icg_warn, icg_problems = None, False, None, []
+if ICG_URL:
+    try:
+        _nat, _parts, icg_problems = load_icg_sheet(ICG_URL)
+        ICG, ICG_FROM_SHEET = (_nat, _parts), True
+    except Exception as e:
+        icg_problems = [f"Could not read the ICG sheet ({e}). Using the microdata file instead, if there is one."]
+if ICG is None:
+    icg_path, icg_warn = latest_file(
+        "icg", ("*.dta",), root_patterns=("*.dta",),
+        content_key=lambda f: pd.read_stata(f, columns=["ola"])["ola"].max())
+    ICG = load_icg(str(icg_path), _stamp(icg_path)) if icg_path else None
+# ICC: the monthly Google Sheet when it is connected; otherwise UTDT's workbook (.xls).
+ICC, icc_warn, icc_problems = None, None, []
+if ICC_URL:
+    try:
+        ICC, icc_problems = load_icc_sheet(ICC_URL)
+    except Exception as e:
+        icc_problems = [f"Could not read the ICC sheet ({e}). Using the ICC workbook instead, if there is one."]
+icc_path = None
+if ICC is None:
+    icc_path, icc_warn = latest_file("icc", ("*.xls", "*.xlsx"), root_patterns=("*ICC*.xls", "*ICC*.xlsx"))
+    ICC = load_icc(str(icc_path), _stamp(icc_path)) if icc_path else None
 
 ICG_SOURCE = ("Government Confidence Index (ICG), Escuela de Gobierno, Universidad Torcuato Di Tella; "
-              "fieldwork by Poliarquía Consultores. Computed from the microdata with the official weights.")
+              "fieldwork by Poliarquía Consultores. "
+              + ("Values from UTDT's monthly reports; history computed from the microdata with the official weights."
+                 if ICG_FROM_SHEET else "Computed from the microdata with the official weights."))
 ICC_SOURCE = ("Consumer Confidence Index (ICC), Centro de Investigación en Finanzas, "
               "Universidad Torcuato Di Tella.")
 PM_SOURCE = f"Polymarket, \"Argentina Presidential Election Winner\" market ({pm.EVENT_URL})."
@@ -199,7 +288,7 @@ if ICC:
     fresh.append(f"Consumer confidence: {icc_mod.national(ICC)['date'].max():%B %Y}")
 fresh.append("Prediction markets: refreshed every 5 minutes")
 st.caption("Latest data. " + "; ".join(fresh) + ".")
-for w in (icg_warn, icc_warn):
+for w in (icg_warn, icc_warn, *icg_problems, *icc_problems):
     if w:
         st.warning(w)
 
@@ -288,9 +377,9 @@ def find(keys, venues):
     return None
 
 
-def source_picker(key: str) -> list:
+def source_picker(key: str, container=None) -> list:
     options = AVAILABLE + (["Both"] if len(AVAILABLE) > 1 else [])
-    choice = st.radio("Market", options, index=len(options) - 1, horizontal=True, key=key,
+    choice = (container or st).radio("Market", options, index=len(options) - 1, horizontal=True, key=key,
                       help="Polymarket lines are solid and Kalshi lines are dashed.")
     return AVAILABLE if choice == "Both" else [choice]
 
@@ -299,15 +388,23 @@ def line_name(label: str, v: str, venues: list) -> str:
     return f"{label} ({v})" if len(venues) > 1 else label
 
 
-def market_chart(lines: list, key: str, height: int = 420, y_title="Probability of winning"):
+def market_controls(key: str):
+    """Market and period selectors side by side, above the chart."""
+    c1, c2 = st.columns([1, 1.6])
+    venues = source_picker(f"src_{key}", c1)
+    period = period_picker(f"per_{key}", "daily", "3 months", c2)
+    return venues, period
+
+
+def market_chart(lines: list, key: str, period=None, height: int = 420, y_title="Probability of winning"):
     """lines: (name, series, color, dash)."""
     fig = go.Figure()
     for name, s, color, dash in lines:
         s = s.dropna()
         fig.add_scatter(x=s.index, y=s.values, name=name, mode="lines",
                         line=dict(color=color, width=2.6, dash=dash), hovertemplate="%{y:.1f}%")
-    base_layout(fig, y_title, height=height, y_suffix="%")
-    st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key=key)
+    base_layout(fig, y_title, height=height, y_suffix="%", period=period)
+    st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key=key)
 
 
 def venue_info(venues: list) -> dict:
@@ -359,7 +456,7 @@ else:
     @st.fragment
     def section_head_to_head():
         st.subheader("Milei vs. Kicillof")
-        venues = source_picker("src_h2h")
+        venues, period = market_controls("h2h")
         milei, kicillof = find(["javier milei"], venues), find(["kicillof"], venues)
         pair = [c for c in (milei, kicillof) if c]
         if len(pair) < 2:
@@ -379,7 +476,7 @@ else:
         lines = [(line_name(c, v, venues), MARKETS[v]["norm"][c], color_for(c, j), VENUE_DASH[v])
                  for v in venues for j, c in enumerate(pair) if c in MARKETS[v]["norm"]]
         if lines:
-            market_chart(lines, "pm_h2h")
+            market_chart(lines, "pm_h2h", period)
         gap = None
         if len(venues) > 1:
             n_pm, n_ks = MARKETS["Polymarket"]["norm"], MARKETS["Kalshi"]["norm"]
@@ -391,8 +488,8 @@ else:
                     fig.add_scatter(x=gap.index, y=gap[c], name=c, mode="lines",
                                     line=dict(color=color_for(c, j), width=2.2), hovertemplate="%{y:+.1f} pts")
                 fig.add_hline(y=0, line=dict(color="#9AA3B2", width=1))
-                base_layout(fig, "Kalshi - Polymarket (pts)", height=280)
-                st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key="pm_gap")
+                base_layout(fig, "Kalshi - Polymarket (pts)", height=280, period=period)
+                st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key="pm_gap")
                 st.caption("Above zero, Kalshi gives the candidate a higher chance than Polymarket.")
         for v in venues:
             source(VENUE_SOURCE[v])
@@ -405,7 +502,7 @@ else:
     @st.fragment
     def section_top4():
         st.subheader("Top four candidates")
-        venues = source_picker("src_top4")
+        venues, period = market_controls("top4")
         top = candidates(venues)[:4]
         if len(venues) == 1:
             cols = st.columns(len(top))
@@ -417,7 +514,7 @@ else:
         lines = [(line_name(c, v, venues), MARKETS[v]["norm"][c], color_for(c, j), VENUE_DASH[v])
                  for v in venues for j, c in enumerate(top) if c in MARKETS[v]["norm"]]
         if lines:
-            market_chart(lines, "pm_top4")
+            market_chart(lines, "pm_top4", period)
         if len(venues) > 1:
             st.caption("Ranked by the average of both markets. A candidate listed in only one market "
                        "shows a blank for the other.")
@@ -434,7 +531,7 @@ else:
         st.subheader("Build your own matchup")
         st.caption("Pick the candidates on each side. Each line adds up the chances of everyone on "
                    "that side, e.g. Milei against all Peronist candidates combined.")
-        venues = source_picker("src_matchup")
+        venues, period = market_controls("matchup")
         cands = candidates(venues)
         milei = find(["javier milei"], venues)
         peronists = pm.default_peronists(cands) or cands[1:2]
@@ -475,7 +572,7 @@ else:
             st.caption("Each market lists a slightly different set of candidates; a candidate a "
                        "market does not list counts as zero there.")
         if lines:
-            market_chart(lines, "pm_matchup")
+            market_chart(lines, "pm_matchup", period)
         for v in venues:
             source(VENUE_SOURCE[v])
         sides = pd.DataFrame({"side": [name_a] * len(side_a) + [name_b] * len(side_b),
@@ -557,6 +654,7 @@ else:
                          help="Valid votes leaves out undecided and blank answers and rescales the "
                               "rest to 100%, like an election result.")
         pollsters = sorted(POLLS["pollster"].unique())
+        period = period_picker("per_polls", "polls", "All")
         c3, c4 = st.columns([3, 1])
         chosen = c3.multiselect("Pollsters", pollsters, default=pollsters, key="poll_firms")
         smooth3 = c4.toggle("3-month average", value=False, key="poll_smooth",
@@ -595,9 +693,9 @@ else:
                 fig.add_scatter(x=ln.index + pd.Timedelta(days=14), y=ln.values, mode="lines+markers",
                                 name=g, legendgroup=g, line=dict(color=col, width=3),
                                 marker=dict(size=5), hovertemplate="average %{y:.1f}%<extra>" + g + "</extra>")
-        base_layout(fig, "Vote intention", height=460, y_suffix="%")
+        base_layout(fig, "Vote intention", height=460, y_suffix="%", period=period)
         fig.update_layout(hovermode="closest")
-        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key="polls_chart")
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key="polls_chart")
         if level == "space":
             st.caption("Individual parties: a poll that reports an alliance as a single figure "
                        "(e.g. \"LLA + PRO\") appears under that alliance, not under each party.")
@@ -615,7 +713,8 @@ else:
         download("polls", {
             "Monthly average": mo.rename(columns={"date": "month"}),
             "By poll": pp.drop(columns=["poll_id", "is_party"]).rename(columns={"date": "month"}),
-            "Rows as loaded": d.drop(columns=["poll_id", "is_party"]).rename(columns={"date": "month"}),
+            "Rows as loaded": d[["date", "pollster", "space", "bloc", "value", "sample_size", "source_url"]]
+            .rename(columns={"date": "month"}),
             "Spaces and blocs": SPACES,
         }, {"Grouped by": level_label, "Shown as": basis, "Data from": poll_origin,
             "Monthly average": "Each pollster counts once per month, weighted by sqrt(sample size)."},
@@ -630,7 +729,9 @@ if ICG and ICC:
     def section_icg_icc():
         st.markdown("Confidence in the government (ICG) next to consumer confidence about the economy "
                     "(ICC), both surveyed monthly by Universidad Torcuato Di Tella.")
-        mode = st.radio("Scale", ["Both on 0-100 (ICG x 20)", "Index, December 2023 = 100"],
+        c1, c2 = st.columns([1, 1.4])
+        period = period_picker("per_cmp", "monthly", "5 years", c2)
+        mode = c1.radio("Scale", ["Both on 0-100 (ICG x 20)", "Index, December 2023 = 100"],
                         horizontal=True, key="cmp_mode")
         a = ICG[0][["date", "ICG"]]
         b = icc_mod.national(ICC)
@@ -653,8 +754,8 @@ if ICG and ICC:
                         line=dict(color=ICG_COLOR, width=2.4), hovertemplate="%{y:.1f}")
         fig.add_scatter(x=m["date"], y=yb, name="Consumer confidence (ICC)", mode="lines",
                         line=dict(color=ICC_COLOR, width=2.4), hovertemplate="%{y:.1f}")
-        base_layout(fig, title)
-        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key="cmp_chart")
+        base_layout(fig, title, period=period)
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key="cmp_chart")
         st.caption(note)
         source(f"{ICG_SOURCE} {ICC_SOURCE}")
         download("both series", {"ICG vs ICC": m}, {"ICG": ICG_SOURCE, "ICC": ICC_SOURCE,
@@ -662,7 +763,7 @@ if ICG and ICC:
 
     section_icg_icc()
 else:
-    st.info("Add the ICG microdata (.dta) and the ICC workbook (Serie_ICC_MM-YY.xls) to the repository to see this chart.")
+    st.info("Connect the ICG and ICC sheets (secrets ICG_CSV_URL and ICC_CSV_URL) to see this chart.")
 
 # ================================================================== 4. ICG BY PRESIDENCY
 st.header("Government confidence by presidency", anchor="government-confidence-by-presidency")
@@ -682,7 +783,7 @@ if ICG:
                         opacity=1 if is_current else 0.75, hovertemplate="%{y:.2f}")
     base_layout(fig, "ICG (0-5)", height=460, time_axis=False)
     fig.update_xaxes(title="Month in office")
-    st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key="pres_chart")
+    st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key="pres_chart")
     last = nat.iloc[-1]
     same = pres[pres["month_in_office"] == last["month_in_office"]].drop(columns="month_in_office").T.dropna()
     st.caption(f"Month {int(last['month_in_office'])} of the current term ({last['date']:%B %Y}): "
@@ -704,6 +805,7 @@ if ICG:
         dims = list(icg_mod.DIMENSIONS) + ["Components"]
         c1, c2 = st.columns([2, 1])
         dim = c1.selectbox("Break down by", dims, index=0, key="icg_dim")
+        period = period_picker("per_icg_bd", "monthly", "5 years")
         smooth = c2.toggle("3-month moving average", value=False, key="icg_smooth",
                            help="Averages each month with the two before it. Recommended for small "
                                 "groups such as primary education or ages 18-29.")
@@ -722,14 +824,17 @@ if ICG:
             nat = nat.rolling(3, min_periods=3).mean() if smooth else nat
             fig.add_scatter(x=nat.index, y=nat, name="National", mode="lines",
                             line=dict(color="#9AA3B2", width=1.6, dash="dot"), hovertemplate="%{y:.2f}")
-        base_layout(fig, "ICG (0-5)", height=440)
-        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key="icg_bd_chart")
-        if dim != "Components":
+        base_layout(fig, "ICG (0-5)", height=440, period=period)
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key="icg_bd_chart")
+        if dim != "Components" and t["n"].notna().any():
             latest = t[t["date"] == t["date"].max()]
             st.caption(f"Respondents in {t['date'].max():%B %Y}: "
                        + "; ".join(f"{r.category} {int(r.n)}" for r in latest.itertuples())
                        + ". Groups with fewer than about 300 respondents move a lot from month to "
                          "month by chance alone.")
+        elif dim != "Components":
+            st.caption("Small groups (for example primary education or ages 18-29) have few respondents "
+                       "and move a lot from month to month by chance alone; the 3-month average helps.")
         else:
             st.caption("The ICG is the average of these five components.")
         source(ICG_SOURCE)
@@ -738,7 +843,7 @@ if ICG:
         download(f"ICG by {dim.lower()}", {
             f"By {dim}"[:31]: wide.reset_index(),
             "Long format": t,
-            **({"Sample sizes": n_wide.reset_index()} if dim != "Components" else {}),
+            **({"Sample sizes": n_wide.reset_index()} if dim != "Components" and t["n"].notna().any() else {}),
         }, {"Source": ICG_SOURCE, "Breakdown": dim,
             "Confidence interval": "ci_low / ci_high: approximate 95% interval (Kish effective sample size)."},
             f"icg_{dim.lower().replace(' ', '_')}.xlsx", "dl_icg_bd")
@@ -752,6 +857,7 @@ if ICC:
     def section_icc_breakdown():
         dims = icc_mod.dimensions(ICC)
         dim = st.selectbox("Break down by", dims, index=0, key="icc_dim")
+        period = period_picker("per_icc_bd", "monthly", "5 years")
         t = icc_mod.breakdown(ICC, dim)
         wide = t.pivot(index="date", columns="category", values="ICC")
         wide.columns = wide.columns.astype(str)
@@ -762,8 +868,8 @@ if ICC:
                             line=dict(color=PALETTE[i % len(PALETTE)], width=2.2), hovertemplate="%{y:.1f}")
         fig.add_scatter(x=nat.index, y=nat, name="National", mode="lines",
                         line=dict(color="#9AA3B2", width=1.6, dash="dot"), hovertemplate="%{y:.1f}")
-        base_layout(fig, "ICC (0-100)", height=440)
-        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key="icc_bd_chart")
+        base_layout(fig, "ICC (0-100)", height=440, period=period)
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key="icc_bd_chart")
         if dim == "Components":
             st.caption("Personal situation, the macroeconomic situation and buying conditions for "
                        "durable goods and real estate are the three components of the ICC.")
@@ -774,8 +880,8 @@ if ICC:
 
     section_icc_breakdown()
 elif not icc_path:
-    st.info("Add the ICC workbook (Serie_ICC_MM-YY.xls) to the repository to see this section.")
+    st.info("Connect the ICC sheet (secret ICC_CSV_URL) to see this section.")
 
 st.divider()
-st.caption("Built with public data. Figures are recomputed whenever a new file is uploaded; "
+st.caption("Built with public data. Polls and confidence indices refresh within 15 minutes of an edit to their sheets; "
            "prediction market prices refresh every 5 minutes.")

@@ -109,3 +109,115 @@ def breakdown(df, nat, dimension: str) -> pd.DataFrame:
         t = _weighted(df, ["date", dimension]).rename(columns={dimension: "category"})
     t["category"] = pd.Categorical(t["category"], categories=category_order(dimension), ordered=True)
     return t.sort_values(["date", "category"])[["date", "category", "ICG", "ci_low", "ci_high", "n"]]
+
+
+# ------------------------------------------------------------------ monthly sheet (Google Sheets)
+# One row per month, typed from UTDT's monthly report. Header -> (dimension, category).
+SHEET_COLUMNS = [
+    ("ICG", "Total", "ICG"),
+    ("Evaluacion general", "Components", COMPONENTS["eval_gob_rec"]),
+    ("Interes general", "Components", COMPONENTS["benef_gob_rec"]),
+    ("Eficiencia", "Components", COMPONENTS["adm_gp_rec"]),
+    ("Honestidad", "Components", COMPONENTS["cor_gob_rec"]),
+    ("Capacidad", "Components", COMPONENTS["resol_prob_rec"]),
+    ("CABA", "Region", "CABA"),
+    ("GBA", "Region", "GBA"),
+    ("Interior", "Region", "Interior"),
+    ("Varones", "Gender", "Men"),
+    ("Mujeres", "Gender", "Women"),
+    ("18-29", "Age", "18-29"),
+    ("30-49", "Age", "30-49"),
+    ("50+", "Age", "50+"),
+    ("Primario", "Education", "Primary"),
+    ("Secundario", "Education", "Secondary"),
+    ("Terciario/Univ", "Education", "Tertiary / university"),
+    ("Exp. Mejor", "Economic outlook", "Better"),
+    ("Exp. Igual", "Economic outlook", "Same"),
+    ("Exp. Peor", "Economic outlook", "Worse"),
+    ("Exp. NS/NC", "Economic outlook", "Don't know"),
+]
+SHEET_HEADERS = ["year", "month"] + [h for h, _, _ in SHEET_COLUMNS]
+
+
+def _key(s) -> str:
+    import re
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9+/]", "", s)
+
+
+def _num(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip().str.replace(",", ".", regex=False)
+    return pd.to_numeric(s.replace({"": None, "nan": None, "None": None, "-": None}), errors="coerce")
+
+
+def sheet_template(nat: pd.DataFrame, parts: dict) -> pd.DataFrame:
+    """Build the sheet (one row per month) from series computed from the microdata."""
+    out = pd.DataFrame({"date": nat["date"]})
+    for header, dim, cat in SHEET_COLUMNS:
+        if dim == "Total":
+            s = nat.set_index("date")["ICG"]
+        elif dim == "Components":
+            s = nat.set_index("date")[cat]
+        else:
+            t = parts[dim]
+            s = t[t["category"].astype(str) == cat].set_index("date")["ICG"]
+        out[header] = out["date"].map(s).round(2)
+    out.insert(0, "month", out["date"].dt.month)
+    out.insert(0, "year", out["date"].dt.year)
+    return out.drop(columns="date")
+
+
+def from_sheet(raw: pd.DataFrame) -> tuple:
+    """Read the monthly sheet. Returns (national table, {dimension: long table}, problems)."""
+    problems = []
+    cols = {_key(c): c for c in raw.columns}
+    missing = [h for h in ["year", "month", "ICG"] if _key(h) not in cols]
+    if missing:
+        raise ValueError("Missing columns in the ICG sheet: " + ", ".join(missing))
+    df = pd.DataFrame({h: _num(raw[cols[_key(h)]]) if _key(h) in cols else pd.Series(dtype=float, index=raw.index)
+                       for h in SHEET_HEADERS})
+    df = df.dropna(how="all")
+    bad = df[["year", "month", "ICG"]].isna().any(axis=1) | ~df["month"].between(1, 12)
+    if bad.any():
+        problems.append(f"{int(bad.sum())} row(s) of the ICG sheet skipped: missing year, month or ICG "
+                        "(sheet rows: " + ", ".join(str(i + 2) for i in df.index[bad][:12]) + ").")
+    df = df[~bad].copy()
+    df["date"] = pd.to_datetime(dict(year=df["year"].astype(int), month=df["month"].astype(int), day=1))
+    dup = df["date"].duplicated(keep="last")
+    if dup.any():
+        problems.append("Some months appear twice in the ICG sheet; the lower row was used for: "
+                        + ", ".join(f"{d:%b %Y}" for d in df.loc[dup, "date"]) + ".")
+        df = df[~df["date"].duplicated(keep="last")]
+    df = df.sort_values("date").reset_index(drop=True)
+
+    values = df[[h for h, _, _ in SHEET_COLUMNS]]
+    out_of_range = (values < 0) | (values > 5)
+    if out_of_range.any().any():
+        rows = [f"{d:%b %Y}" for d in df.loc[out_of_range.any(axis=1), "date"]]
+        problems.append("Values outside 0-5 in the ICG sheet (check for typos): " + ", ".join(rows) + ".")
+    comp = [h for h, dim, _ in SHEET_COLUMNS if dim == "Components"]
+    full = df[comp].notna().all(axis=1)
+    gap = (df.loc[full, comp].mean(axis=1) - df.loc[full, "ICG"]).abs()
+    off = gap[gap > 0.03]
+    if len(off):
+        problems.append("In these months the ICG is not the average of its five components, "
+                        "which usually means a typo: " + ", ".join(f"{d:%b %Y}" for d in df.loc[off.index, "date"]) + ".")
+
+    nat = df[["date", "ICG"]].copy()
+    for h, dim, cat in SHEET_COLUMNS:
+        if dim == "Components":
+            nat[cat] = df[h]
+    nat["ci_low"] = nat["ci_high"] = nat["n"] = np.nan
+    nat = nat.merge(presidents_for(nat["date"]), on="date")
+    nat["monthly_change_%"] = nat["ICG"].pct_change() * 100
+
+    parts = {}
+    for dim in [*DIMENSIONS, "Components"]:
+        heads = [(h, cat) for h, d, cat in SHEET_COLUMNS if d == dim]
+        t = pd.concat([pd.DataFrame({"date": df["date"], "category": cat, "ICG": df[h]}) for h, cat in heads])
+        t = t.dropna(subset=["ICG"])
+        t["ci_low"] = t["ci_high"] = t["n"] = np.nan
+        t["category"] = pd.Categorical(t["category"], categories=category_order(dim), ordered=True)
+        parts[dim] = t.sort_values(["date", "category"]).reset_index(drop=True)
+    return nat, parts, problems

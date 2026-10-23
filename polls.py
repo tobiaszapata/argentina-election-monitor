@@ -96,6 +96,8 @@ def clean(raw: pd.DataFrame, raw_spaces: pd.DataFrame | None = None) -> tuple:
         if c not in df.columns:
             df[c] = None
     df = df[COLUMNS].dropna(how="all")
+    if df.empty:  # sheet with headers only: nothing loaded yet
+        return pd.DataFrame(), spaces, problems
     df = df[~df.astype(str).apply(lambda r: all(str(v).strip() in ("", "nan", "None", "<NA>") for v in r), axis=1)]
     for c in ("pollster", "space", "source_url"):
         df[c] = df[c].astype(str).str.strip().replace({"nan": None, "None": None, "": None})
