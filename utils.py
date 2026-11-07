@@ -79,29 +79,66 @@ def to_excel(sheets: dict, info: dict) -> bytes:
     return buf.getvalue()
 
 
-def read_sheet(src, name: str = "sheet") -> tuple:
+def sheet_csv_url(url: str) -> str:
+    """Turn the usual Google Sheets links into a CSV download link for the same tab:
+    published web page (pubhtml) -> published CSV; editor link (/edit#gid=..) -> CSV export."""
+    url = str(url).strip()
+    if "docs.google.com/spreadsheets" not in url:
+        return url
+    gid = re.search(r"[#?&]gid=(\d+)", url)
+    if "/d/e/" in url:  # published link
+        base = url.split("?")[0].split("#")[0].replace("/pubhtml", "/pub")
+        q = "output=csv" + (f"&single=true&gid={gid.group(1)}" if gid else "")
+        return f"{base}?{q}"
+    doc = re.search(r"/spreadsheets/d/([\w-]+)", url)
+    if doc and "output=csv" not in url and "format=csv" not in url:
+        return (f"https://docs.google.com/spreadsheets/d/{doc.group(1)}/export?format=csv"
+                + (f"&gid={gid.group(1)}" if gid else ""))
+    return url
+
+
+def read_sheet(src, name: str = "sheet", expected: list | None = None) -> tuple:
     """Read a published Google Sheets CSV (or a local CSV) tolerantly.
 
     Columns are the ones with a header in row 1. Cells written to the right of the last header
     (rows longer than the header) are ignored instead of breaking the read; the returned notes
-    say in which sheet rows that happened. Returns (DataFrame of strings, notes)."""
+    say in which sheet rows that happened. When `expected` columns are missing from row 1, it
+    raises an error that shows what row 1 holds (usually: the link points to another tab).
+    Returns (DataFrame of strings, notes)."""
     import csv
 
     if str(src).startswith(("http://", "https://")):
         import requests
-        r = requests.get(str(src), timeout=20)
+        r = requests.get(sheet_csv_url(src), timeout=20)
+        if "accounts.google.com" in r.url or "ServiceLogin" in r.url:
+            raise ValueError(f"the {name} link asks for a Google sign-in, so the tab is not published. "
+                             "In Google Sheets use File > Share > Publish to web, pick the tab and "
+                             "'Comma-separated values (.csv)', and paste that link in the app's secrets.")
         r.raise_for_status()
         r.encoding = "utf-8"
         text = r.text
     else:
         text = Path(src).read_text(encoding="utf-8-sig")
-    rows = list(csv.reader(io.StringIO(text.lstrip("﻿"))))
+    text = text.lstrip("\ufeff")
+    if text.lstrip()[:1] == "<":
+        raise ValueError(f"the {name} link returns a web page, not CSV. In Google Sheets use File > Share > "
+                         "Publish to web, pick the tab (not 'Entire document') and 'Comma-separated values "
+                         "(.csv)', then paste that link in the app's secrets.")
+    rows = list(csv.reader(io.StringIO(text)))
     notes = []
     if not rows:
-        return pd.DataFrame(), notes
+        return pd.DataFrame(columns=expected or []), notes
     header = [h.strip() for h in rows[0]]
     while header and not header[-1]:
         header.pop()
+    if expected:
+        have = {re.sub(r"\s+", "_", h.lower()) for h in header}
+        missing = [c for c in expected if c not in have]
+        if missing and len(rows) > 1:
+            shown = ", ".join(h for h in header if h)[:120] or "nothing"
+            raise ValueError(f"the {name} link does not point to the right tab: row 1 should have the "
+                             f"columns {', '.join(expected)}, but it has: {shown}. Publish that tab on its "
+                             "own (File > Share > Publish to web) and use its link.")
     width = len(header)
     extra = [i + 1 for i, r in enumerate(rows[1:], start=1) if any(c.strip() for c in r[width:])]
     if extra:

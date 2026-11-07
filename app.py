@@ -228,14 +228,17 @@ def load_venue_intraday(venue: str, ids: pd.DataFrame, start_ts: int):
 @st.cache_data(ttl=600, show_spinner="Loading polls...")
 def load_polls(polls_url: str | None, spaces_url: str | None, stamp: float):
     if polls_url:
-        raw, notes = read_sheet(polls_url, "polls sheet")
+        raw, notes = read_sheet(polls_url, "polls sheet", polls_mod.REQUIRED)
         origin = "Google Sheets"
     else:
         raw, notes = read_sheet(POLLS_FILE, "polls file") if POLLS_FILE else (pd.DataFrame(columns=polls_mod.COLUMNS), [])
         origin = POLLS_FILE.name if POLLS_FILE else "no polls file"
     raw_spaces = None
     if spaces_url:
-        raw_spaces, n2 = read_sheet(spaces_url, "spaces sheet")
+        try:
+            raw_spaces, n2 = read_sheet(spaces_url, "spaces sheet", polls_mod.SPACE_COLUMNS)
+        except Exception as e:  # keep the polls working with the default space-to-bloc list
+            raw_spaces, n2 = None, [f"Could not read the spaces sheet: {e} Using the default space-to-bloc list."]
         notes += n2
     elif SPACES_FILE:
         raw_spaces, n2 = read_sheet(SPACES_FILE, "spaces file")
