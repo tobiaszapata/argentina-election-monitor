@@ -77,48 +77,82 @@ def fetch_current() -> pd.DataFrame:
     return df.sort_values("probability", ascending=False).reset_index(drop=True)
 
 
-def _history_one(token: str) -> pd.DataFrame:
-    params = {"market": token, "interval": "max", "fidelity": 1440}
+def _prices(params: dict) -> list:
     r = requests.get(f"{CLOB}/prices-history", params=params, timeout=TIMEOUT)
     r.raise_for_status()
-    hist = r.json().get("history", [])
-    if not hist:  # some markets only answer with explicit time windows
+    return r.json().get("history", [])
+
+
+def _history_one(token: str) -> pd.Series:
+    """Hourly prices, indexed by UTC hour (last price within each hour). Each snapshot is stamped
+    one second earlier, so a price taken exactly at midnight counts as the previous day's close."""
+    hist = []
+    try:
+        hist = _prices({"market": token, "interval": "max", "fidelity": 60})
+    except Exception:
+        hist = []
+    ts = [h["t"] for h in hist]
+    coarse = len(ts) > 2 and pd.Series(ts).diff().median() > 3 * 3600
+    if not hist or coarse:  # ask in explicit 15-day windows, newest first, until the market's start
         end, hist = int(time.time()), []
-        for _ in range(24):  # up to ~2 years in 30-day chunks
-            start = end - 30 * 86400
-            rr = requests.get(f"{CLOB}/prices-history", timeout=TIMEOUT,
-                              params={"market": token, "startTs": start, "endTs": end, "fidelity": 1440})
-            if rr.ok:
-                chunk = rr.json().get("history", [])
-                if not chunk and hist:
-                    break
-                hist = chunk + hist
+        for _ in range(60):  # up to ~2.5 years
+            start = end - 15 * 86400
+            try:
+                chunk = _prices({"market": token, "startTs": start, "endTs": end, "fidelity": 60})
+            except Exception:
+                chunk = []
+            if not chunk and hist:
+                break
+            hist = chunk + hist
             end = start
     if not hist:
-        return pd.DataFrame(columns=["date", "price"])
+        return pd.Series(dtype=float)
     h = pd.DataFrame(hist)
-    h["date"] = pd.to_datetime(h["t"], unit="s").dt.normalize()
-    return h.groupby("date", as_index=False)["p"].last().rename(columns={"p": "price"})
+    h["time"] = pd.to_datetime(h["t"] - 1, unit="s", utc=True).dt.floor("h")
+    return h.groupby("time")["p"].last()
+
+
+def fetch_intraday(current: pd.DataFrame, start_ts: int) -> pd.DataFrame:
+    """Prices since `start_ts` (Unix seconds) at the finest step Polymarket keeps (about every
+    10 minutes), wide: one column per candidate (raw price), exact UTC times, forward-filled."""
+    end = int(time.time())
+    series = {}
+    for _, row in current.iterrows():
+        if not row["token_yes"]:
+            continue
+        try:
+            hist = _prices({"market": row["token_yes"], "startTs": start_ts, "endTs": end, "fidelity": 10})
+        except Exception:
+            continue
+        if hist:
+            h = pd.DataFrame(hist)
+            series[row["candidate"]] = h.groupby(pd.to_datetime(h["t"], unit="s", utc=True))["p"].last()
+    if not series:
+        return pd.DataFrame()
+    wide = pd.DataFrame(series).sort_index().ffill()
+    wide.index.name = "time"
+    return wide
 
 
 def fetch_history(current: pd.DataFrame) -> pd.DataFrame:
-    """Daily history, wide: one column per candidate (raw price) -> also normalized long table."""
+    """Hourly history, wide: one column per candidate (raw price), UTC hourly index, forward-filled.
+    `current` only needs the columns candidate and token_yes."""
     series = {}
     for _, row in current.iterrows():
         if row["token_yes"]:
-            h = _history_one(row["token_yes"])
-            if not h.empty:
-                series[row["candidate"]] = h.set_index("date")["price"]
+            s = _history_one(row["token_yes"])
+            if not s.empty:
+                series[row["candidate"]] = s
     if not series:
         return pd.DataFrame()
     wide = pd.DataFrame(series).sort_index()
-    wide = wide.reindex(pd.date_range(wide.index.min(), wide.index.max(), freq="D")).ffill()
-    wide.index.name = "date"
+    wide = wide.reindex(pd.date_range(wide.index.min(), wide.index.max(), freq="h")).ffill()
+    wide.index.name = "time"
     return wide
 
 
 def normalize(wide: pd.DataFrame) -> pd.DataFrame:
-    """Rescale each day so candidates sum to 100%."""
+    """Rescale each row (hour or day) so candidates sum to 100%."""
     total = wide.sum(axis=1, min_count=1)
     return wide.div(total, axis=0) * 100
 

@@ -27,7 +27,7 @@ try:
     from monitor import polls as polls_mod
     from monitor import polymarket as pm
     from monitor import kalshi as ks
-    from monitor.utils import find_file, latest_file, to_excel
+    from monitor.utils import find_file, latest_file, read_sheet, to_excel
 except ModuleNotFoundError:
     try:
         import icc as icc_mod
@@ -35,7 +35,7 @@ except ModuleNotFoundError:
         import polls as polls_mod
         import polymarket as pm
         import kalshi as ks
-        from utils import find_file, latest_file, to_excel
+        from utils import find_file, latest_file, read_sheet, to_excel
     except ModuleNotFoundError:
         st.error("The helper files are missing. The repository needs a folder called `monitor` "
                  "(next to app.py) containing icc.py, icg.py, kalshi.py, polls.py, polymarket.py and utils.py.")
@@ -72,7 +72,7 @@ AXIS_LINE = "#4A5568" if DARK else "#B8C0CC"
 # Period buttons: label -> days back from the last data point ("term" = since Milei took office).
 PERIODS = {
     "daily": [("All", None), ("6 months", 183), ("3 months", 92), ("1 month", 31),
-              ("15 days", 15), ("7 days", 7)],
+              ("15 days", 15), ("7 days", 7), ("Today", "today")],
     "monthly": [("All", None), ("10 years", 3653), ("5 years", 1827), ("Current term", "term"),
                 ("1 year", 366)],
     "polls": [("All", None), ("1 year", 366), ("6 months", 183), ("3 months", 92)],
@@ -94,7 +94,12 @@ def apply_period(fig: go.Figure, period):
     if not xs:
         return
     end = max(x.max() for x in xs)
-    start = pd.Timestamp("2023-12-01") if period == "term" else end - pd.Timedelta(days=period)
+    if period == "term":
+        start = pd.Timestamp("2023-12-01")
+    elif period == "today":
+        start = end.normalize()
+    else:
+        start = end - pd.Timedelta(days=period)
     for t in fig.data:
         if t.x is None or not len(t.x):
             continue
@@ -154,7 +159,7 @@ def base_layout(fig: go.Figure, y_title: str, height: int = 420, time_axis: bool
         legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="left", x=0, title=None,
                     font=dict(color=INK)),
         yaxis=dict(title=y_title, gridcolor=GRID, zeroline=False, ticksuffix=y_suffix, fixedrange=True,
-                   color=INK),
+                   color=INK, automargin=True),
         xaxis=dict(gridcolor=GRID, showline=True, linecolor=AXIS_LINE, fixedrange=True, color=INK),
     )
     return fig
@@ -181,12 +186,16 @@ def load_icg(path: str, stamp: float):
 
 @st.cache_data(ttl=600, show_spinner="Loading government confidence sheet...")
 def load_icg_sheet(url: str):
-    return icg_mod.from_sheet(pd.read_csv(url, dtype=str))
+    raw, notes = read_sheet(url, "ICG sheet")
+    nat, parts, problems = icg_mod.from_sheet(raw)
+    return nat, parts, notes + problems
 
 
 @st.cache_data(ttl=600, show_spinner="Loading consumer confidence sheet...")
 def load_icc_sheet(url: str):
-    return icc_mod.from_sheet(pd.read_csv(url, dtype=str))
+    raw, notes = read_sheet(url, "ICC sheet")
+    icc, problems = icc_mod.from_sheet(raw)
+    return icc, notes + problems
 
 
 @st.cache_data(show_spinner="Loading consumer confidence series...")
@@ -204,24 +213,35 @@ def load_venue_now(venue: str):
 
 
 @st.cache_data(ttl=1800, show_spinner="Fetching prediction market price history...")
-def load_venue_history(venue: str, current: pd.DataFrame):
-    return VENUES[venue].fetch_history(current)
+def load_venue_history(venue: str, ids: pd.DataFrame):
+    """Hourly history. `ids` holds only stable identifiers (candidate, token or ticker), so the
+    cache lasts its full 30 minutes instead of resetting every time prices move."""
+    return VENUES[venue].fetch_history(ids)
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching today's prices...")
+def load_venue_intraday(venue: str, ids: pd.DataFrame, start_ts: int):
+    """Today's prices since midnight in Argentina, at the finest step each market offers."""
+    return VENUES[venue].fetch_intraday(ids, start_ts)
 
 
 @st.cache_data(ttl=600, show_spinner="Loading polls...")
 def load_polls(polls_url: str | None, spaces_url: str | None, stamp: float):
     if polls_url:
-        raw = pd.read_csv(polls_url, dtype=str)
+        raw, notes = read_sheet(polls_url, "polls sheet")
         origin = "Google Sheets"
     else:
-        raw = pd.read_csv(POLLS_FILE, dtype=str) if POLLS_FILE else pd.DataFrame(columns=polls_mod.COLUMNS)
+        raw, notes = read_sheet(POLLS_FILE, "polls file") if POLLS_FILE else (pd.DataFrame(columns=polls_mod.COLUMNS), [])
         origin = POLLS_FILE.name if POLLS_FILE else "no polls file"
     raw_spaces = None
     if spaces_url:
-        raw_spaces = pd.read_csv(spaces_url, dtype=str)
+        raw_spaces, n2 = read_sheet(spaces_url, "spaces sheet")
+        notes += n2
     elif SPACES_FILE:
-        raw_spaces = pd.read_csv(SPACES_FILE, dtype=str)
+        raw_spaces, n2 = read_sheet(SPACES_FILE, "spaces file")
+        notes += n2
     rows, spaces, problems = polls_mod.clean(raw, raw_spaces)
+    problems = notes + problems
     if not spaces_url and not SPACES_FILE:
         problems = problems + ([] if rows.empty else [
             "The spaces sheet is not connected (secret SPACES_CSV_URL), so the default "
@@ -319,9 +339,51 @@ def canon(name: str) -> str:
     return re.sub(r"[^a-z ]", "", re.sub(r"\s+", " ", n.lower())).strip()
 
 
+ART = "America/Argentina/Buenos_Aires"
+ID_COLUMNS = {"Polymarket": ["candidate", "token_yes"], "Kalshi": ["candidate", "ticker", "open_time"]}
+
+
+def to_art(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """UTC timestamps -> Argentine local time, without time zone (for the charts)."""
+    idx = index if index.tz is not None else index.tz_localize("UTC")
+    return idx.tz_convert(ART).tz_localize(None)
+
+
+def build_series(hourly_utc: pd.DataFrame, live: pd.Series, live_at: pd.Timestamp) -> tuple:
+    """Daily closes in Argentine time: for each day, the price at the last time available before
+    midnight in Argentina, rescaled so candidates sum to 100%. Today's row is the live price.
+    Also returns yesterday's raw close (the starting point of today's intraday line)."""
+    raw = hourly_utc.copy()
+    raw.index = to_art(raw.index)
+    raw = raw.ffill()
+    daily_raw = raw.groupby(raw.index.floor("D")).last()
+    today = live_at.normalize()
+    past = daily_raw[daily_raw.index < today]
+    daily = pd.concat([pm.normalize(past), pd.DataFrame([live], index=[today])])
+    daily.index.name = "date (Argentina)"
+    return daily, (past.iloc[-1] if not past.empty else None)
+
+
+def build_intraday(intra_utc: pd.DataFrame, prev_close, live: pd.Series, live_at: pd.Timestamp) -> pd.DataFrame:
+    """Today since 00:00 in Argentina: starts at yesterday's close, then every price recorded
+    today, and ends with the live price."""
+    today = live_at.normalize()
+    parts = []
+    if prev_close is not None:
+        parts.append(pd.DataFrame([prev_close], index=[today]))
+    if intra_utc is not None and not intra_utc.empty:
+        raw = intra_utc.copy()
+        raw.index = to_art(raw.index)
+        parts.append(raw[(raw.index > today) & (raw.index < live_at)])
+    out = pm.normalize(pd.concat(parts).sort_index().ffill()) if parts else pd.DataFrame()
+    out = pd.concat([out, pd.DataFrame([live], index=[live_at])])
+    out.index.name = "time (Argentina)"
+    return out
+
+
 MARKETS, DISPLAY = {}, {}
 for venue in VENUES:
-    entry = {"now": None, "norm": pd.DataFrame(), "error": None}
+    entry = {"now": None, "norm": pd.DataFrame(), "intraday": pd.DataFrame(), "live_at": None, "error": None}
     try:
         now = load_venue_now(venue).copy()
         attrs = dict(now.attrs)
@@ -330,12 +392,26 @@ for venue in VENUES:
         now["candidate"] = now["candidate"].map(lambda c: DISPLAY[canon(c)])
         now.attrs = attrs
         entry["now"] = now
+        live_at = to_art(pd.DatetimeIndex([attrs["fetched_at"]]))[0].floor("min")
+        entry["live_at"] = live_at
+        live = now.groupby("candidate")["probability"].sum()
         try:
-            hist = load_venue_history(venue, load_venue_now(venue))
+            raw_now = load_venue_now(venue)
+            ids = raw_now[[c for c in ID_COLUMNS[venue] if c in raw_now]].copy()
+            ids.attrs = {}
+            fix = lambda t: t.rename(columns=lambda c: DISPLAY.get(canon(c), c)).T.groupby(level=0).sum(
+                min_count=1).T  # same display names; merge duplicated names
+            hist = load_venue_history(venue, ids)
+            prev_close = None
             if hist is not None and not hist.empty:
-                hist = hist.rename(columns=lambda c: DISPLAY.get(canon(c), c))
-                hist = hist.T.groupby(level=0).sum(min_count=1).T  # merge duplicated names
-                entry["norm"] = pm.normalize(hist)
+                entry["norm"], prev_close = build_series(fix(hist), live, live_at)
+            midnight = pd.Timestamp(live_at.normalize()).tz_localize(ART)
+            try:
+                intra = load_venue_intraday(venue, ids, int(midnight.timestamp()))
+                intra = fix(intra) if intra is not None and not intra.empty else None
+            except Exception:
+                intra = None
+            entry["intraday"] = build_intraday(intra, prev_close, live, live_at)
         except Exception as e:
             entry["error"] = f"price history unavailable ({e})"
     except Exception as e:  # network or API change: keep the rest of the page working
@@ -356,11 +432,17 @@ def prob(v: str) -> pd.Series:
 
 
 def change_7d(v: str, c: str):
+    """Live probability minus the close of exactly 7 days ago (Argentine time)."""
     norm = MARKETS[v]["norm"]
-    if norm.empty or c not in norm or len(norm) < 8 or c not in prob(v):
+    if norm.empty or c not in norm or c not in prob(v):
         return None
-    past = norm[c].iloc[-8]
-    return None if pd.isna(past) else prob(v)[c] - past
+    past = norm[c].get(MARKETS[v]["live_at"].normalize() - pd.Timedelta(days=7))
+    return None if past is None or pd.isna(past) else prob(v)[c] - past
+
+
+def series_for(v: str, period) -> pd.DataFrame:
+    """Today's intraday prices for "Today"; daily closes for every other period."""
+    return MARKETS[v]["intraday"] if period == "today" else MARKETS[v]["norm"]
 
 
 def candidates(venues: list) -> list:
@@ -396,31 +478,53 @@ def market_controls(key: str):
     return venues, period
 
 
-def market_chart(lines: list, key: str, period=None, height: int = 420, y_title="Probability of winning"):
-    """lines: (name, series, color, dash)."""
+def market_chart(lines: list, key: str, period=None, height: int = 420, y_title="Probability of winning",
+                 suffix="%", fmt="%{y:.1f}%"):
+    """lines: (name, series, color, dash). The last point of each line is the live price and is
+    marked with a dot."""
+    today = period == "today"
     fig = go.Figure()
     for name, s, color, dash in lines:
         s = s.dropna()
-        fig.add_scatter(x=s.index, y=s.values, name=name, mode="lines",
-                        line=dict(color=color, width=2.6, dash=dash), hovertemplate="%{y:.1f}%")
-    base_layout(fig, y_title, height=height, y_suffix="%", period=period)
+        if s.empty:
+            continue
+        fig.add_scatter(x=s.index, y=s.values, name=name, mode="lines", legendgroup=name,
+                        line=dict(color=color, width=2.2 if today else 2.6, dash=dash), hovertemplate=fmt)
+        fig.add_scatter(x=[s.index[-1]], y=[s.values[-1]], mode="markers", legendgroup=name, showlegend=False,
+                        marker=dict(color=color, size=9, line=dict(color="white", width=1.5)),
+                        hovertemplate=fmt + " (live)<extra>" + name + "</extra>")
+    base_layout(fig, y_title, height=height, y_suffix=suffix, period=period)
+    if today:
+        fig.update_xaxes(tickformat="%H:%M")
     st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key=key)
+
+
+def time_caption(venues: list, period):
+    live = max(MARKETS[v]["live_at"] for v in venues)
+    freq = ("today's prices since midnight (about every 10 minutes on Polymarket, every minute on Kalshi), "
+            "starting from yesterday's close" if period == "today"
+            else "one point per day: the probability at the last time available before midnight")
+    st.caption(f"Argentine time (UTC-3). The line shows {freq}; the dot at the end is the live probability, "
+               f"refreshed every 5 minutes (last update {live:%d %b %H:%M}).")
 
 
 def venue_info(venues: list) -> dict:
     info = {f"Source ({v})": VENUE_SOURCE[v] for v in venues}
     info["Price"] = ("Mid-point between best bid and best ask when the spread is 10 cents or less; "
                      "otherwise last traded price.")
-    info["Probability"] = "Prices rescaled so that each market's candidates sum to 100% each day."
-    info["Retrieved"] = " / ".join(f"{v} {MARKETS[v]['now'].attrs['fetched_at']:%Y-%m-%d %H:%M} UTC"
-                                   for v in venues)
+    info["Probability"] = "Prices rescaled so that each market's candidates sum to 100% at each time."
+    info["Time zone"] = ("Argentina (UTC-3). Daily close = probability at the last time available before "
+                         "midnight in Argentina; it can differ slightly from the market's own daily close "
+                         "(UTC). Today's value is the live probability. The 'Today' sheet has today's prices "
+                         "since midnight, starting from yesterday's close.")
+    info["Retrieved"] = " / ".join(f"{v} {MARKETS[v]['live_at']:%Y-%m-%d %H:%M} (Argentina)" for v in venues)
     return info
 
 
-def history_sheet(venues: list, group: list) -> pd.DataFrame:
+def history_sheet(venues: list, group: list, table: str = "norm") -> pd.DataFrame:
     parts = []
     for v in venues:
-        n = MARKETS[v]["norm"]
+        n = MARKETS[v][table]
         cols = [c for c in group if c in n]
         if cols:
             parts.append(n[cols].rename(columns=lambda c: f"{c} ({v})"))
@@ -473,27 +577,27 @@ else:
                 i += 1
         st.caption("Chance of each one becoming president, from each market's winner contract. "
                    "Neither market has a specific Milei vs. Kicillof runoff contract.")
-        lines = [(line_name(c, v, venues), MARKETS[v]["norm"][c], color_for(c, j), VENUE_DASH[v])
-                 for v in venues for j, c in enumerate(pair) if c in MARKETS[v]["norm"]]
+        lines = [(line_name(c, v, venues), series_for(v, period)[c], color_for(c, j), VENUE_DASH[v])
+                 for v in venues for j, c in enumerate(pair) if c in series_for(v, period)]
         if lines:
             market_chart(lines, "pm_h2h", period)
         gap = None
         if len(venues) > 1:
-            n_pm, n_ks = MARKETS["Polymarket"]["norm"], MARKETS["Kalshi"]["norm"]
+            n_pm, n_ks = series_for("Polymarket", period), series_for("Kalshi", period)
+            idx = n_pm.index.union(n_ks.index)  # live points can differ by a few minutes
+            n_pm, n_ks = n_pm.reindex(idx).ffill(), n_ks.reindex(idx).ffill()
             gap = pd.DataFrame({c: n_ks[c] - n_pm[c] for c in pair if c in n_pm and c in n_ks}).dropna(how="all")
             if not gap.empty:
                 st.markdown("**Gap between markets** (Kalshi minus Polymarket, percentage points)")
-                fig = go.Figure()
-                for j, c in enumerate(gap.columns):
-                    fig.add_scatter(x=gap.index, y=gap[c], name=c, mode="lines",
-                                    line=dict(color=color_for(c, j), width=2.2), hovertemplate="%{y:+.1f} pts")
-                fig.add_hline(y=0, line=dict(color="#9AA3B2", width=1))
-                base_layout(fig, "Kalshi - Polymarket (pts)", height=280, period=period)
-                st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key="pm_gap")
+                market_chart([(c, gap[c], color_for(c, j), "solid") for j, c in enumerate(gap.columns)],
+                             "pm_gap", period, height=280, y_title="Kalshi - Polymarket (pts)", suffix="",
+                             fmt="%{y:+.1f} pts")
                 st.caption("Above zero, Kalshi gives the candidate a higher chance than Polymarket.")
         for v in venues:
             source(VENUE_SOURCE[v])
-        sheets = {"Daily probability": history_sheet(venues, pair)}
+        time_caption(venues, period)
+        sheets = {"Daily close (Argentina)": history_sheet(venues, pair),
+                  "Today (Argentina)": history_sheet(venues, pair, "intraday")}
         if gap is not None and not gap.empty:
             sheets["Gap Kalshi-Polymarket"] = gap.reset_index()
         sheets.update(current_sheets(venues, pair))
@@ -511,8 +615,8 @@ else:
                 col.metric(c, f"{prob(venues[0])[c]:.1f}%", None if d is None else f"{d:+.1f} pts in 7 days")
         else:
             show_comparison(comparison_table(top, venues))
-        lines = [(line_name(c, v, venues), MARKETS[v]["norm"][c], color_for(c, j), VENUE_DASH[v])
-                 for v in venues for j, c in enumerate(top) if c in MARKETS[v]["norm"]]
+        lines = [(line_name(c, v, venues), series_for(v, period)[c], color_for(c, j), VENUE_DASH[v])
+                 for v in venues for j, c in enumerate(top) if c in series_for(v, period)]
         if lines:
             market_chart(lines, "pm_top4", period)
         if len(venues) > 1:
@@ -520,7 +624,9 @@ else:
                        "shows a blank for the other.")
         for v in venues:
             source(VENUE_SOURCE[v])
-        sheets = {"Daily probability": history_sheet(venues, top)}
+        time_caption(venues, period)
+        sheets = {"Daily close (Argentina)": history_sheet(venues, top),
+                  "Today (Argentina)": history_sheet(venues, top, "intraday")}
         if len(venues) > 1:
             sheets["Comparison now"] = comparison_table(candidates(venues), venues)
         sheets.update(current_sheets(venues))
@@ -548,19 +654,20 @@ else:
             st.info("Choose at least one candidate on each side.")
             return
         groups = {name_a: side_a, name_b: side_b}
-        now_rows, lines, hist = [], [], {}
+        now_rows, lines, hist, hist_h = [], [], {}, {}
         for v in venues:
             p = prob(v)
             rest = [c for c in p.index if c not in side_a + side_b]
             g = dict(groups, **({"Everyone else": rest} if rest else {}))
             now_rows.append({"Market": v, **{k: p.reindex(m).sum() for k, m in g.items()}})
-            norm = MARKETS[v]["norm"]
+            norm, intra, shown = MARKETS[v]["norm"], MARKETS[v]["intraday"], series_for(v, period)
             for j, (k, m) in enumerate(g.items()):
                 cols = [c for c in m if c in norm]
                 if cols:
-                    s = norm[cols].sum(axis=1, min_count=1)
-                    hist[line_name(k, v, venues)] = s
-                    lines.append((line_name(k, v, venues), s, PALETTE[[0, 1, 5][j]], VENUE_DASH[v]))
+                    hist[line_name(k, v, venues)] = norm[cols].sum(axis=1, min_count=1)
+                    hist_h[line_name(k, v, venues)] = intra[[c for c in cols if c in intra]].sum(axis=1, min_count=1)
+                    lines.append((line_name(k, v, venues), shown[[c for c in cols if c in shown]].sum(axis=1, min_count=1),
+                                  PALETTE[[0, 1, 5][j]], VENUE_DASH[v]))
         now_t = pd.DataFrame(now_rows)
         if len(venues) == 1:
             cols = st.columns(len(now_t.columns) - 1)
@@ -573,12 +680,14 @@ else:
                        "market does not list counts as zero there.")
         if lines:
             market_chart(lines, "pm_matchup", period)
+            time_caption(venues, period)
         for v in venues:
             source(VENUE_SOURCE[v])
         sides = pd.DataFrame({"side": [name_a] * len(side_a) + [name_b] * len(side_b),
                               "candidate": side_a + side_b})
         download("this matchup", {
-            "Daily probability": pd.DataFrame(hist).reset_index() if hist else pd.DataFrame(),
+            "Daily close (Argentina)": pd.DataFrame(hist).reset_index() if hist else pd.DataFrame(),
+            "Today (Argentina)": pd.DataFrame(hist_h).reset_index() if hist_h else pd.DataFrame(),
             "Now": now_t, "Sides": sides,
         }, venue_info(venues), "markets_matchup.xlsx", "dl_pm_matchup")
 
@@ -622,7 +731,7 @@ else:
 # ================================================================== 2. POLLS
 st.header("Polls", anchor="polls")
 st.markdown("National vote intention by political space, as published by each pollster. "
-            "Each dot is one poll; the line is the monthly average across pollsters.")
+            "Each dot is one poll; the dotted line is the trend across pollsters.")
 try:
     polls_url = st.secrets.get("POLLS_CSV_URL") or None
     spaces_url = st.secrets.get("SPACES_CSV_URL") or None
@@ -638,6 +747,60 @@ except Exception as e:
 for p in poll_problems:
     st.warning(p)
 
+# Colors offered for poll groups: name -> hex. The first ones follow the reference chart.
+GROUP_COLORS = {
+    "Violet": "#7B61C9", "Light blue": "#4FA8E0", "Blue": "#1F5FAD", "Yellow": "#E3B505",
+    "Orange": "#F08A24", "Green": "#3F9C7B", "Red": "#D0544B", "Pink": "#D46BA8",
+    "Brown": "#8D6E63", "Grey": "#9AA3B2",
+}
+# Suggested color by keyword in the group name (first match wins); the user can change it.
+COLOR_HINTS = [("provincias", "Orange"), ("lla", "Violet"), ("libertad", "Violet"),
+               ("peron", "Light blue"), ("fuerza patria", "Light blue"), ("patria", "Light blue"),
+               ("left", "Red"), ("fit", "Red"), ("izquierda", "Red"), ("ucr", "Green"),
+               ("pro", "Yellow"), ("juntos", "Yellow"), ("blank", "Grey"), ("blanco", "Grey"),
+               ("undecided", "Grey"), ("indecisos", "Grey"), ("other", "Brown"), ("otros", "Brown"),
+               ("rest", "Brown"), ("resto", "Brown")]
+TREND_WINDOWS = {"7 days": 7, "15 days": 15, "30 days": 30, "60 days": 60}
+GROUPING_HELP = {
+    "Blocs": "Adds up the parties of each alliance, as set in the spaces sheet. Every poll can be "
+             "compared, whether it reports the parties separately or together.",
+    "Individual parties": "Each space as it was loaded. A party's line only uses the polls that "
+                          "report it on its own.",
+    "Custom groups": "Build your own groups: choose how many, name them and pick the spaces each one adds up.",
+}
+
+
+def suggested_colors(names: list) -> dict:
+    """A suggested color per group: by keyword first, then the unused colors in order."""
+    out, used = {}, set()
+    for n in names:
+        low = n.lower()
+        hint = next((c for k, c in COLOR_HINTS if re.search(rf"\b{re.escape(k)}", low)), None)
+        if hint and hint not in used:
+            out[n] = hint
+            used.add(hint)
+    free = [c for c in GROUP_COLORS if c not in used and c != "Grey"] + ["Grey"]
+    for n in names:
+        if n not in out:
+            out[n] = free.pop(0) if free else "Grey"
+    return out
+
+
+def swatch(hex_color: str) -> str:
+    return (f"<div style='width:1.4rem;height:1.4rem;border-radius:50%;margin-bottom:1rem;"
+            f"background:{hex_color};'></div>")
+
+
+def default_custom_groups(polls: pd.DataFrame) -> list:
+    """Starting point for custom groups: LLA + PRO, Peronism, and the other parties."""
+    present = polls.drop_duplicates("space").set_index("space")
+    parties = present[present["is_party"]]
+    lla = [s for s in parties.index if parties.loc[s, "bloc"] == "LLA + PRO"]
+    per = [s for s in parties.index if parties.loc[s, "bloc"] == "Peronism"]
+    rest = [s for s in parties.index if s not in lla + per]
+    return [("LLA + PRO", lla), ("Peronism", per), ("Rest", rest)]
+
+
 if POLLS is None or POLLS.empty:
     st.info("No polls loaded yet. Add rows to the polls sheet (one row per space reported by "
             "each poll) and they will appear here on the next refresh. Expected columns: "
@@ -645,79 +808,169 @@ if POLLS is None or POLLS.empty:
 else:
     @st.fragment
     def section_polls():
-        c1, c2 = st.columns(2)
-        level_label = c1.radio("Group by", ["Blocs (alliances added up)", "Individual parties"],
-                               key="poll_level", help="Blocs add up the parties of each alliance, so "
-                               "every poll can be compared. Individual parties only use polls that "
-                               "report that party on its own.")
-        basis = c2.radio("Show as", ["% of all respondents", "% of valid votes"], key="poll_basis",
-                         help="Valid votes leaves out undecided and blank answers and rescales the "
-                              "rest to 100%, like an election result.")
+        # ---- 1. how to group
+        st.markdown("**1. How to group the polls**")
+        mode = st.radio("How to group the polls", list(GROUPING_HELP), horizontal=True,
+                        key="poll_level", label_visibility="collapsed")
+        st.caption(GROUPING_HELP[mode])
+
+        # ---- 2. groups and colors (depends on 1)
+        st.markdown("**2. Groups and colors**")
+        color_names = list(GROUP_COLORS)
+        rows = []  # (name, members or None, show, color)
+        box = st.container(border=True)
+        if mode == "Custom groups":
+            defaults = default_custom_groups(POLLS)
+            spaces_present = sorted(POLLS["space"].unique())
+            n = box.columns([1, 3])[0].number_input("Number of groups", min_value=1, max_value=8,
+                                                    value=len(defaults), step=1, key="cg_count")
+            slot_names = [defaults[i][0] if i < len(defaults) else f"Group {i + 1}" for i in range(8)]
+            sugg = suggested_colors(slot_names)  # fixed per slot, so a chosen color never jumps
+            h = box.columns([0.6, 1.6, 3, 1.3, 0.3])
+            for col, label in zip(h, ["Show", "Name", "Spaces it adds up", "Color", ""]):
+                col.caption(label)
+            for i in range(n):
+                dname, dsp = defaults[i] if i < len(defaults) else ("", [])
+                c = box.columns([0.6, 1.6, 3, 1.3, 0.3], vertical_alignment="center")
+                show = c[0].checkbox("Show", value=True, key=f"cg_show_{i}", label_visibility="collapsed")
+                name = c[1].text_input("Name", dname, key=f"cg_name_{i}", placeholder=f"Group {i + 1}",
+                                       label_visibility="collapsed").strip()
+                members = c[2].multiselect("Spaces", spaces_present, default=dsp, key=f"cg_sp_{i}",
+                                           label_visibility="collapsed", placeholder="Pick spaces")
+                label = name or (" + ".join(members) if members else f"Group {i + 1}")
+                color = c[3].selectbox("Color", color_names, key=f"cg_color_{i}",
+                                       index=color_names.index(sugg[slot_names[i]]),
+                                       label_visibility="collapsed")
+                c[4].markdown(swatch(GROUP_COLORS[color]), unsafe_allow_html=True)
+                if members:
+                    rows.append((label, members, show, color))
+            used = [sp for _, m, _, _ in rows for sp in m]
+            twice = sorted({sp for sp in used if used.count(sp) > 1})
+            if twice:
+                box.warning("These spaces are in more than one group and count in each: " + ", ".join(twice) + ".")
+            box.caption("Spaces left out of every group are not drawn, but still count in the total "
+                        "for % of valid votes.")
+            if not rows:
+                st.info("Pick the spaces of at least one group.")
+                return
+            level = {name: m for name, m, _, _ in rows}
+        else:
+            level = "bloc" if mode == "Blocs" else "space"
+            base = polls_mod.per_poll(POLLS, level, False)
+            size = base.groupby("group")["value"].mean().sort_values(ascending=False)
+            party = set(base.loc[base["is_party"], "group"])
+            names = [g for g in size.index if g in party] + [g for g in size.index if g not in party]
+            sugg = suggested_colors(names)
+            h = box.columns([0.6, 4.6, 1.3, 0.3])
+            for col, label in zip(h, ["Show", "Group" if mode == "Blocs" else "Party", "Color", ""]):
+                col.caption(label)
+            for g in names:
+                c = box.columns([0.6, 4.6, 1.3, 0.3], vertical_alignment="center")
+                show = c[0].checkbox("Show", value=g in party, key=f"show_{mode}_{g}",
+                                     label_visibility="collapsed")
+                c[1].markdown(g + ("" if g in party else "  \n<span style='opacity:.6;font-size:.85em'>"
+                                   "not a party: hidden with % of valid votes</span>"), unsafe_allow_html=True)
+                color = c[2].selectbox("Color", color_names, index=color_names.index(sugg[g]),
+                                       key=f"color_{mode}_{g}", label_visibility="collapsed")
+                c[3].markdown(swatch(GROUP_COLORS[color]), unsafe_allow_html=True)
+                rows.append((g, None, show, color))
+
+        # ---- 3. options
+        st.markdown("**3. Options**")
+        o1, o2 = st.columns([1, 1.2])
+        basis = o1.radio("Show as", ["% of all respondents", "% of valid votes"], horizontal=True,
+                         key="poll_basis", help="Valid votes leaves out blank and undecided answers and "
+                                                "rescales the parties to 100%, like an election result.")
+        trend_label = o2.segmented_control("Trend line window", list(TREND_WINDOWS),
+                                           default="30 days", key="poll_trend") or "30 days"
+        o3, o4 = st.columns([1, 1.2])
+        with o3:
+            period = period_picker("per_polls", "polls", "All")
         pollsters = sorted(POLLS["pollster"].unique())
-        period = period_picker("per_polls", "polls", "All")
-        c3, c4 = st.columns([3, 1])
-        chosen = c3.multiselect("Pollsters", pollsters, default=pollsters, key="poll_firms")
-        smooth3 = c4.toggle("3-month average", value=False, key="poll_smooth",
-                            help="Averages each month with the two before it.")
+        with o4.expander(f"Pollsters ({len(pollsters)})"):
+            chosen = st.multiselect("Pollsters", pollsters, default=pollsters, key="poll_firms",
+                                    label_visibility="collapsed")
+        window = TREND_WINDOWS[trend_label]
         d = POLLS[POLLS["pollster"].isin(chosen)]
         if d.empty:
             st.info("Select at least one pollster.")
             return
-        level = "bloc" if level_label.startswith("Blocs") else "space"
         valid = basis == "% of valid votes"
         pp = polls_mod.per_poll(d, level, valid)
+        if pp.empty:
+            st.info("None of the selected polls report these spaces.")
+            return
         mo = polls_mod.monthly(pp)
-        line = polls_mod.smooth(mo, 3) if smooth3 else mo.pivot(index="date", columns="group", values="average")
-        latest = mo[mo["date"] == mo["date"].max()].set_index("group")["average"]
-        parties = pp.loc[pp["is_party"], "group"].unique()
-        order = [g for g in latest.sort_values(ascending=False).index if g in parties]
-        order += [g for g in mo.groupby("group")["average"].mean().sort_values(ascending=False).index
-                  if g in parties and g not in order]
-        pos = {p: i for i, p in enumerate(sorted(pp["pollster"].unique()))}
-        spread = max(len(pos) - 1, 1)
+        tr = polls_mod.trend(pp, window)
+        present = set(pp["group"])
+        shown = [(g, GROUP_COLORS[c]) for g, _, show, c in rows if show and g in present]
+        if not shown:
+            st.info("Tick at least one group in step 2.")
+            return
 
         fig = go.Figure()
-        for i, g in enumerate(order):
-            col = party_color(g, i)
-            dots = pp[pp["group"] == g].copy()
-            # spread pollsters across the month so dots of the same month do not overlap
-            dots["x"] = dots["date"] + pd.to_timedelta(
-                dots["pollster"].map(pos) / spread * 20 - 10 + 14, unit="D")
+        for g, col in shown:
+            dots = pp[pp["group"] == g]
             fig.add_scatter(
-                x=dots["x"], y=dots["value"], mode="markers", name=g, legendgroup=g, showlegend=False,
-                marker=dict(color=col, size=9, opacity=0.35),
-                customdata=dots[["pollster"]].assign(m=dots["date"].dt.strftime("%b %Y")).values,
-                hovertemplate="%{customdata[0]} (%{customdata[1]}): %{y:.1f}%<extra>" + g + "</extra>")
-            if g in line:
-                ln = line[g].dropna()
-                fig.add_scatter(x=ln.index + pd.Timedelta(days=14), y=ln.values, mode="lines+markers",
-                                name=g, legendgroup=g, line=dict(color=col, width=3),
-                                marker=dict(size=5), hovertemplate="average %{y:.1f}%<extra>" + g + "</extra>")
-        base_layout(fig, "Vote intention", height=460, y_suffix="%", period=period)
-        fig.update_layout(hovermode="closest")
+                x=dots["date"], y=dots["value"], mode="markers", name=g, legendgroup=g, showlegend=True,
+                marker=dict(color=col, size=9, opacity=0.45, line=dict(width=0)),
+                customdata=dots[["pollster"]].assign(d=dots["date"].dt.strftime("%d %b %Y")).values,
+                hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]}: %{y:.1f}%<extra>" + g + "</extra>")
+            if g in tr:
+                ln = tr[g].dropna()
+                fig.add_scatter(x=ln.index, y=ln.values, mode="lines", name=f"{g} trend", legendgroup=g,
+                                showlegend=False, connectgaps=True,
+                                line=dict(color=col, width=3.2, dash="dot"),
+                                hovertemplate="trend: %{y:.1f}%<extra>" + g + "</extra>")
+        base_layout(fig, "", height=500, period=period)
+        unit = "% of valid votes" if valid else "% of all respondents"
+        fig.update_layout(
+            hovermode="closest", margin=dict(l=45, r=10, t=95, b=55),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                        font=dict(size=12, color=INK), itemsizing="constant"),
+            annotations=[
+                dict(text="<b>Presidential election polls</b>", xref="paper", yref="paper", x=0, y=1.21,
+                     xanchor="left", yanchor="bottom", showarrow=False, font=dict(size=16, color=INK)),
+                dict(text=f"{unit}, time-varying trend, {window}-day weighted average", xref="paper",
+                     yref="paper", x=0, y=1.14, xanchor="left", yanchor="bottom", showarrow=False,
+                     font=dict(size=12, color=MUTED)),
+                dict(text=f"Source: various media polls ({pp['pollster'].nunique()} pollsters, "
+                          f"{pp['poll_id'].nunique()} polls).", xref="paper", yref="paper", x=0, y=-0.11,
+                     xanchor="left", yanchor="top", showarrow=False, font=dict(size=11, color=MUTED)),
+            ])
+        fig.update_xaxes(tickformat="%d-%b-%y", showgrid=False)
+        fig.update_yaxes(automargin=True, ticksuffix="")
         st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, theme=None, key="polls_chart")
-        if level == "space":
-            st.caption("Individual parties: a poll that reports an alliance as a single figure "
-                       "(e.g. \"LLA + PRO\") appears under that alliance, not under each party.")
-        st.caption("The line is the monthly average: each pollster counts once per month, weighted "
-                   "by the square root of its sample size (the median sample size when one is missing; "
-                   "equal weights when none is reported).")
+        notes = [f"Each dot is one poll. The dotted line is a weighted average of the polls around each "
+                 f"date: the closer a poll is, the more it weighs, and almost all the weight comes from "
+                 f"polls within {window // 2} days on either side. Each pollster counts once, weighted by "
+                 "the square root of its sample size when it is reported."]
+        if mode == "Individual parties":
+            notes.append("A poll that reports an alliance as a single figure (e.g. \"LLA + PRO\") appears "
+                         "under that alliance, not under each party.")
+        st.caption(" ".join(notes))
 
         st.markdown("**Monthly average**")
-        table = mo[mo["group"].isin(order)].pivot(index="date", columns="group", values="average")[order]
+        cols_order = [g for g, _ in shown if g in set(mo["group"])]
+        table = mo[mo["group"].isin(cols_order)].pivot(index="date", columns="group", values="average")[cols_order]
         table = table.join(mo.groupby("date")["pollsters"].max()).sort_index(ascending=False).reset_index()
         table["date"] = table["date"].dt.strftime("%b %Y")
         st.dataframe(table.rename(columns={"date": "month"}), hide_index=True, width="stretch",
-                     column_config={g: st.column_config.NumberColumn(format="%.1f%%") for g in order})
+                     column_config={g: st.column_config.NumberColumn(format="%.1f%%") for g in cols_order})
+        st.caption("Monthly average: each pollster counts once per month.")
         source("compiled from the pollsters listed; links in the downloadable file.")
+        groups_sheet = (pd.DataFrame([(g, sp) for g, m in level.items() for sp in m], columns=["group", "space"])
+                        if isinstance(level, dict) else SPACES)
         download("polls", {
+            "By poll": pp[["date", "pollster", "group", "value", "sample_size"]].sort_values(["date", "pollster"]),
+            f"Trend {window}-day": tr.reset_index(names="date"),
             "Monthly average": mo.rename(columns={"date": "month"}),
-            "By poll": pp.drop(columns=["poll_id", "is_party"]).rename(columns={"date": "month"}),
-            "Rows as loaded": d[["date", "pollster", "space", "bloc", "value", "sample_size", "source_url"]]
-            .rename(columns={"date": "month"}),
-            "Spaces and blocs": SPACES,
-        }, {"Grouped by": level_label, "Shown as": basis, "Data from": poll_origin,
-            "Monthly average": "Each pollster counts once per month, weighted by sqrt(sample size)."},
+            "Rows as loaded": d[["date", "pollster", "space", "bloc", "value", "sample_size", "source_url"]],
+            "Groups": groups_sheet,
+        }, {"Grouped by": mode, "Shown as": basis, "Data from": poll_origin,
+            "Trend": f"Gaussian-weighted average of nearby polls ({window}-day window: ~95% of the "
+                     "weight within +/- half the window); each pollster counts once, weighted by "
+                     "sqrt(sample size)."},
             "polls.xlsx", "dl_polls")
 
     section_polls()

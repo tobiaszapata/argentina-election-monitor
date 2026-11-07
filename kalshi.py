@@ -91,13 +91,15 @@ def fetch_current() -> pd.DataFrame:
 
 
 def _history_one(ticker: str, open_time) -> pd.Series:
+    """Hourly closes, indexed by UTC hour. Each candle is stamped one second before it ends,
+    so a candle closing exactly at midnight counts as the close of the previous day."""
     end = int(time.time())
-    start = int(pd.Timestamp(open_time).timestamp()) if open_time else end - 730 * 86400
+    start = int(pd.Timestamp(open_time).timestamp()) if open_time and str(open_time) != "nan" else end - 730 * 86400
     candles = []
-    while start < end:  # chunks of ~1 year of daily candles
-        chunk_end = min(start + 365 * 86400, end)
+    while start < end:  # 30-day chunks of hourly candles (720 per request)
+        chunk_end = min(start + 30 * 86400, end)
         data = _get(f"/series/{SERIES}/markets/{ticker}/candlesticks",
-                    {"start_ts": start, "end_ts": chunk_end, "period_interval": 1440})
+                    {"start_ts": start, "end_ts": chunk_end, "period_interval": 60})
         candles += data.get("candlesticks", [])
         start = chunk_end
     rows = []
@@ -107,15 +109,43 @@ def _history_one(ticker: str, open_time) -> pd.Series:
         trade = _f((c.get("price") or {}).get("close_dollars")) or _f((c.get("price") or {}).get("previous_dollars"))
         p = _price(bid, ask, trade)
         if p:
-            rows.append((pd.to_datetime(c["end_period_ts"], unit="s").normalize(), p))
+            rows.append((pd.to_datetime(c["end_period_ts"] - 1, unit="s", utc=True).floor("h"), p))
     if not rows:
         return pd.Series(dtype=float)
-    s = pd.DataFrame(rows, columns=["date", "price"]).groupby("date")["price"].last()
-    return s
+    return pd.DataFrame(rows, columns=["time", "price"]).groupby("time")["price"].last()
+
+
+def fetch_intraday(current: pd.DataFrame, start_ts: int) -> pd.DataFrame:
+    """One-minute candles since `start_ts` (Unix seconds), wide: one column per candidate (raw
+    price), stamped at the end of each minute (UTC), forward-filled."""
+    end = int(time.time())
+    series = {}
+    for _, row in current.iterrows():
+        try:
+            data = _get(f"/series/{SERIES}/markets/{row['ticker']}/candlesticks",
+                        {"start_ts": start_ts, "end_ts": end, "period_interval": 1})
+        except Exception:
+            continue
+        rows = []
+        for c in data.get("candlesticks", []):
+            bid = _f((c.get("yes_bid") or {}).get("close_dollars"))
+            ask = _f((c.get("yes_ask") or {}).get("close_dollars"))
+            trade = _f((c.get("price") or {}).get("close_dollars")) or _f((c.get("price") or {}).get("previous_dollars"))
+            p = _price(bid, ask, trade)
+            if p:
+                rows.append((pd.to_datetime(c["end_period_ts"], unit="s", utc=True), p))
+        if rows:
+            series[row["candidate"]] = pd.DataFrame(rows, columns=["time", "price"]).groupby("time")["price"].last()
+    if not series:
+        return pd.DataFrame()
+    wide = pd.DataFrame(series).sort_index().ffill()
+    wide.index.name = "time"
+    return wide
 
 
 def fetch_history(current: pd.DataFrame) -> pd.DataFrame:
-    """Daily history, wide: one column per candidate (raw price, forward-filled)."""
+    """Hourly history, wide: one column per candidate (raw price), UTC hourly index, forward-filled.
+    `current` only needs the columns candidate, ticker and open_time."""
     series = {}
     for _, row in current.iterrows():
         try:
@@ -127,12 +157,12 @@ def fetch_history(current: pd.DataFrame) -> pd.DataFrame:
     if not series:
         return pd.DataFrame()
     wide = pd.DataFrame(series).sort_index()
-    wide = wide.reindex(pd.date_range(wide.index.min(), wide.index.max(), freq="D")).ffill()
-    wide.index.name = "date"
+    wide = wide.reindex(pd.date_range(wide.index.min(), wide.index.max(), freq="h")).ffill()
+    wide.index.name = "time"
     return wide
 
 
 def normalize(wide: pd.DataFrame) -> pd.DataFrame:
-    """Rescale each day so candidates sum to 100%."""
+    """Rescale each row (hour or day) so candidates sum to 100%."""
     total = wide.sum(axis=1, min_count=1)
     return wide.div(total, axis=0) * 100

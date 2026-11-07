@@ -77,3 +77,36 @@ def to_excel(sheets: dict, info: dict) -> bytes:
         xw.sheets["About"].column_dimensions["A"].width = 18
         xw.sheets["About"].column_dimensions["B"].width = 110
     return buf.getvalue()
+
+
+def read_sheet(src, name: str = "sheet") -> tuple:
+    """Read a published Google Sheets CSV (or a local CSV) tolerantly.
+
+    Columns are the ones with a header in row 1. Cells written to the right of the last header
+    (rows longer than the header) are ignored instead of breaking the read; the returned notes
+    say in which sheet rows that happened. Returns (DataFrame of strings, notes)."""
+    import csv
+
+    if str(src).startswith(("http://", "https://")):
+        import requests
+        r = requests.get(str(src), timeout=20)
+        r.raise_for_status()
+        r.encoding = "utf-8"
+        text = r.text
+    else:
+        text = Path(src).read_text(encoding="utf-8-sig")
+    rows = list(csv.reader(io.StringIO(text.lstrip("﻿"))))
+    notes = []
+    if not rows:
+        return pd.DataFrame(), notes
+    header = [h.strip() for h in rows[0]]
+    while header and not header[-1]:
+        header.pop()
+    width = len(header)
+    extra = [i + 1 for i, r in enumerate(rows[1:], start=1) if any(c.strip() for c in r[width:])]
+    if extra:
+        notes.append(f"The {name} has cells to the right of its last column (sheet rows "
+                     + ", ".join(str(i) for i in extra[:12]) + (" ..." if len(extra) > 12 else "")
+                     + "); they were ignored. Delete them or move them to another tab.")
+    body = [(r + [""] * width)[:width] for r in rows[1:]]
+    return pd.DataFrame(body, columns=header, dtype=str), notes

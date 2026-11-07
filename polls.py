@@ -1,7 +1,9 @@
-"""Poll tracker: national vote intention by political space, one value per month.
+"""Poll tracker: national vote intention by political space.
 
 Polls sheet (one row per space reported by a poll):
-    year, month, pollster, space, value, sample_size, source_url
+    year, month, pollster, space, value, sample_size, source_url, day
+`day` is optional (the last column, so older sheets keep working): with it each poll sits on
+its fieldwork date; without it, on the 15th of the month.
 Spaces sheet (which bloc each space belongs to):
     space, bloc
 
@@ -13,7 +15,7 @@ import re
 import numpy as np
 import pandas as pd
 
-COLUMNS = ["year", "month", "pollster", "space", "value", "sample_size", "source_url"]
+COLUMNS = ["year", "month", "pollster", "space", "value", "sample_size", "source_url", "day"]
 REQUIRED = ["year", "month", "pollster", "space", "value"]
 SPACE_COLUMNS = ["space", "bloc"]
 DEFAULT_N = 1000
@@ -24,17 +26,21 @@ DEFAULT_SPACES = [
     ("PRO", "LLA + PRO"),
     ("LLA + PRO", "LLA + PRO"),
     ("Fuerza Patria", "Peronism"),
-    ("Provincias Unidas", "Provincias Unidas"),
-    ("UCR", "Others"),
+    ("Provincias Unidas", "Provincias Unidas / Others"),
+    ("UCR", "Provincias Unidas / Others"),
+    ("Otros", "Provincias Unidas / Others"),
+    ("Provincias Unidas / Otros", "Provincias Unidas / Others"),
     ("FIT-U", "Left (FIT-U)"),
-    ("Otros", "Others"),
-    ("Blanco", "Blank"),
-    ("Indecisos", "Undecided"),
+    ("Blanco", "Blank + undecided"),
+    ("Indecisos", "Blank + undecided"),
+    ("Blanco + Indecisos", "Blank + undecided"),
 ]
 # Blocs that are not parties: left out of "% of valid votes" and not drawn as lines.
 NON_PARTY = {"blank": "Blank", "blanco": "Blank", "en blanco": "Blank",
              "undecided": "Undecided", "indecisos": "Undecided", "ns/nc": "Undecided",
-             "no sabe": "Undecided"}
+             "no sabe": "Undecided", "blank + undecided": "Blank + undecided",
+             "blanco + indecisos": "Blank + undecided", "blanco + undecided": "Blank + undecided"}
+NON_PARTY_BLOCS = {"Blank", "Undecided", "Blank + undecided"}
 MONTHS = {"ene": 1, "jan": 1, "feb": 2, "mar": 3, "abr": 4, "apr": 4, "may": 5, "jun": 6,
           "jul": 7, "ago": 8, "aug": 8, "sep": 9, "set": 9, "oct": 10, "nov": 11,
           "dic": 12, "dec": 12}
@@ -99,6 +105,7 @@ def clean(raw: pd.DataFrame, raw_spaces: pd.DataFrame | None = None) -> tuple:
     if df.empty:  # sheet with headers only: nothing loaded yet
         return pd.DataFrame(), spaces, problems
     df = df[~df.astype(str).apply(lambda r: all(str(v).strip() in ("", "nan", "None", "<NA>") for v in r), axis=1)]
+    df["day"] = _num(df["day"])
     for c in ("pollster", "space", "source_url"):
         df[c] = df[c].astype(str).str.strip().replace({"nan": None, "None": None, "": None})
     df["value"] = _num(df["value"])
@@ -116,7 +123,15 @@ def clean(raw: pd.DataFrame, raw_spaces: pd.DataFrame | None = None) -> tuple:
                         "space or value (sheet rows: "
                         + ", ".join(str(i + 2) for i in df.index[bad][:12]) + ").")
     df = df[~bad].copy()
-    df["date"] = pd.to_datetime(dict(year=df["year_n"].astype(int), month=df["month_n"].astype(int), day=1))
+    df["month_start"] = pd.to_datetime(dict(year=df["year_n"].astype(int), month=df["month_n"].astype(int), day=1))
+    days_in = df["month_start"].dt.days_in_month
+    bad_day = df["day"].notna() & ((df["day"] < 1) | (df["day"] > days_in))
+    if bad_day.any():
+        problems.append(f"{int(bad_day.sum())} row(s) have a day that does not exist in that month; "
+                        "they were placed on the 15th (sheet rows: "
+                        + ", ".join(str(i + 2) for i in df.index[bad_day][:12]) + ").")
+    day = df["day"].where(~bad_day).fillna(15).astype(int)
+    df["date"] = df["month_start"] + pd.to_timedelta(day - 1, unit="D")
 
     lookup = dict(zip(spaces["space"].map(_norm), spaces["bloc"]))
     names = dict(zip(spaces["space"].map(_norm), spaces["space"]))
@@ -128,42 +143,94 @@ def clean(raw: pd.DataFrame, raw_spaces: pd.DataFrame | None = None) -> tuple:
     df["space"] = key.map(names).fillna(df["space"])
     df["bloc"] = key.map(lookup).fillna(df["space"])
     df["bloc"] = df["bloc"].map(lambda b: NON_PARTY.get(_norm(b), b))
-    df["is_party"] = ~df["bloc"].isin(["Blank", "Undecided"])
-    df["poll_id"] = df["pollster"] + " | " + df["date"].dt.strftime("%Y-%m")
-    # Same pollster, month and space loaded twice (e.g. two polls that month): average them.
+    df["is_party"] = ~df["bloc"].isin(NON_PARTY_BLOCS)
+    df["poll_id"] = df["pollster"] + " | " + df["date"].dt.strftime("%Y-%m-%d")
+    # Same pollster, date and space loaded twice: average them.
     dup = df.duplicated(["poll_id", "space"], keep=False)
     if dup.any():
-        problems.append(f"{df.loc[dup, 'poll_id'].nunique()} pollster(s) have the same space loaded "
-                        "twice in one month; those values were averaged.")
-        df = (df.groupby(["poll_id", "date", "pollster", "space", "bloc", "is_party"], as_index=False)
+        problems.append(f"{df.loc[dup, 'poll_id'].nunique()} poll(s) have the same space loaded "
+                        "twice on the same date; those values were averaged.")
+        df = (df.groupby(["poll_id", "date", "month_start", "pollster", "space", "bloc", "is_party"],
+                         as_index=False)
                 .agg(value=("value", "mean"), sample_size=("sample_size", "mean"),
                      source_url=("source_url", "first")))
     return df.reset_index(drop=True), spaces, problems
 
 
-def per_poll(df: pd.DataFrame, level: str, valid_votes: bool) -> pd.DataFrame:
-    """One value per poll and group. level: 'bloc' or 'space'."""
-    d = df[df["is_party"]] if valid_votes else df
-    g = (d.groupby(["poll_id", "date", "pollster", level, "is_party"], as_index=False)
-           .agg(value=("value", "sum"), sample_size=("sample_size", "mean")))
+def per_poll(df: pd.DataFrame, level, valid_votes: bool) -> pd.DataFrame:
+    """One value per poll and group.
+    level: 'bloc', 'space', or a dict {group name: [spaces]} for groups built in the app.
+    A group's value in a poll is the sum of the spaces that poll reported."""
+    d = df.copy()
+    # Denominator for valid votes: every party space the poll reported, grouped or not.
+    party_total = df[df["is_party"]].groupby("poll_id")["value"].sum()
+    if isinstance(level, dict):
+        owner = {sp: name for name, members in level.items() for sp in members}
+        d["_group"] = d["space"].map(owner)
+        d = d.dropna(subset=["_group"])
+        d["is_party"] = d["_group"].map(lambda g: not set(level[g]) <= set(df.loc[~df["is_party"], "space"]))
+        level = "_group"
     if valid_votes:
-        g["value"] = g["value"] / g.groupby("poll_id")["value"].transform("sum") * 100
+        d = d[d["is_party"]]
+    keys = ["poll_id", "date", "month_start", "pollster", level, "is_party"]
+    g = d.groupby(keys, as_index=False).agg(value=("value", "sum"), sample_size=("sample_size", "mean"))
+    if valid_votes:
+        g["value"] = g["value"] / g["poll_id"].map(party_total) * 100
     return g.rename(columns={level: "group"})
+
+
+def _weights(d: pd.DataFrame) -> pd.Series:
+    fill = d["sample_size"].median() if d["sample_size"].notna().any() else DEFAULT_N
+    return np.sqrt(d["sample_size"].fillna(fill))
+
+
+def trend(pp: pd.DataFrame, window_days: int) -> pd.DataFrame:
+    """Daily trend: a weighted average of nearby polls, smooth instead of step-like.
+
+    Each poll's weight falls with its distance in days (Gaussian kernel whose width is
+    `window_days`: about 95% of the weight comes from polls within +/- window/2), times the
+    square root of its sample size. Each pollster counts once per day: its nearby polls are
+    averaged first, so prolific pollsters do not dominate. Days with no poll within the
+    window are left empty. Wide table: one column per group."""
+    if pp.empty:
+        return pd.DataFrame()
+    d = pp.assign(w=_weights(pp))
+    days = pd.date_range(d["date"].min(), d["date"].max(), freq="D")
+    t = days.values.astype("datetime64[D]").astype(float)
+    sd = window_days / 4
+    out = {}
+    for g, x in d.groupby("group"):
+        num = np.zeros(len(days))
+        den = np.zeros(len(days))
+        for _, p in x.groupby("pollster"):
+            dist = t[:, None] - p["date"].values.astype("datetime64[D]").astype(float)[None, :]
+            k = np.exp(-0.5 * (dist / sd) ** 2)
+            k[np.abs(dist) > window_days] = 0
+            ksum = k.sum(axis=1)
+            with np.errstate(invalid="ignore"):
+                v = (k * p["value"].values).sum(axis=1) / ksum      # pollster's local average
+            weight = k.max(axis=1) * p["w"].mean()                  # one vote per pollster
+            ok = ksum > 0
+            num[ok] += weight[ok] * v[ok]
+            den[ok] += weight[ok]
+        with np.errstate(invalid="ignore"):
+            out[g] = np.where(den > 1e-3, num / den, np.nan)
+    return pd.DataFrame(out, index=days)
 
 
 def monthly(pp: pd.DataFrame) -> pd.DataFrame:
     """Monthly average per group across pollsters, weighted by sqrt(sample size).
     Missing sample sizes take the median of the others; with none reported, equal weights."""
-    d = pp.copy()
-    fill = d["sample_size"].median() if d["sample_size"].notna().any() else DEFAULT_N
-    d["w"] = np.sqrt(d["sample_size"].fillna(fill))
-    g = d.groupby(["date", "group"])
+    d = pp.assign(w=_weights(pp))
+    by_firm = (d.groupby(["month_start", "group", "pollster"], as_index=False)
+                 .agg(value=("value", "mean"), w=("w", "mean")))
+    g = by_firm.groupby(["month_start", "group"])
     out = pd.DataFrame({
         "average": g.apply(lambda x: np.average(x["value"], weights=x["w"]), include_groups=False),
         "pollsters": g["pollster"].nunique(),
         "lowest": g["value"].min(),
         "highest": g["value"].max(),
-    }).reset_index()
+    }).reset_index().rename(columns={"month_start": "date"})
     return out.sort_values(["date", "average"], ascending=[True, False])
 
 
